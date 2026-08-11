@@ -1,0 +1,12 @@
+# 敏感 / 本地运行时产物，不提交
+token.json
+cursor.json
+.env
+bot.log
+bot.pid
+qr.png
+qr_url.txt
+
+# Python
+__pycache__/
+*.pyc
