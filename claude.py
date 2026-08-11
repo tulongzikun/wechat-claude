@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 # 进程的 OS 用户权限——agent 以当前用户身份跑，能访问该用户可访问的一切。
 AGENT_CWD = os.environ.get("WECHAT_AGENT_CWD", "/home/zhouzikun")
 # agent 单轮最多步数（防止失控长跑烧钱）
-MAX_TURNS = int(os.environ.get("WECHAT_AGENT_MAX_TURNS", "15"))
+MAX_TURNS = int(os.environ.get("WECHAT_AGENT_MAX_TURNS", "12"))
 # 单轮整体超时（秒），超时给用户一句提示，不让一条慢消息卡死收消息循环
 TURN_TIMEOUT = int(os.environ.get("WECHAT_AGENT_TIMEOUT", "120"))
 # 回复最长字符（微信长文体验差，超出截断）
@@ -37,9 +37,11 @@ MAX_REPLY_LEN = 2000
 
 SYSTEM_PROMPT = (
     "你是一个运行在微信里的 AI 助手，托管在一台 Linux 服务器上，"
-    f"工作目录是 {AGENT_CWD}。用简洁、自然的中文回答，尽量短（适合微信阅读）。"
-    "需要时直接用工具（读写文件、Bash、grep、web 搜索）把事办了再回复，"
-    "不要回复\"无法访问/无法查询\"。给用户的回复只写最终结论，省略工具过程。"
+    f"工作目录是 {AGENT_CWD}。用简洁、自然的中文回答，适合微信阅读。"
+    "\n\n【工具使用】按需合理调用：需要本机实时状态（查进程/读文件/跑命令/看日志）时，"
+    "该查就查、该多步就多步，以准确为先；只是不必为求'全面'反复查询同一信息。"
+    "而普通对话、知识问答、翻译、写作、建议这类——直接回答，不调用工具。"
+    "\n\n回复只写最终结论，省略工具过程；不要回复\"无法访问/无法查询\"。"
 )
 
 # 授权用户（全工具）：能读写文件、跑命令、联网

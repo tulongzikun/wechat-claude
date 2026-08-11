@@ -14,6 +14,12 @@ from claude import ask_claude, reset_user
 from ilink import ILinkClient
 from login import load_token, login
 
+
+def _ts() -> str:
+    """日志时间戳 HH:MM:SS，用于测收消息→发回复的端到端延迟。"""
+    return time.strftime("%H:%M:%S")
+
+
 # 游标持久化：重启后接着上次的位置拉消息，避免服务端重复投递已处理的旧消息
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CURSOR_FILE = os.path.join(_DIR, "cursor.json")
@@ -71,7 +77,7 @@ def main() -> None:
 
                 context_token = msg.get("context_token", "")
                 user_id = msg.get("from_user_id", "")
-                print(f"👤 [{user_id}] {text}")
+                print(f"{_ts()} 👤 [{user_id}] {text}")
 
                 # 简单指令：发"重置"清空该用户的对话历史
                 if text.strip() in ("重置", "reset", "/reset"):
@@ -82,7 +88,7 @@ def main() -> None:
 
                 # 3. 回复 —— context_token 原样带回（微信靠它路由到对应对话）
                 client.send_message(user_id, context_token, reply)
-                print(f"🤖 -> [{user_id}] {reply[:60]}{'...' if len(reply) > 60 else ''}")
+                print(f"{_ts()} 🤖 -> [{user_id}] {reply[:60]}{'...' if len(reply) > 60 else ''}")
 
         except KeyboardInterrupt:
             print("\n👋 收到退出信号，Bye~")
