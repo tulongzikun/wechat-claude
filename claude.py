@@ -31,7 +31,9 @@ AGENT_CWD = os.environ.get("WECHAT_AGENT_CWD", "/home/zhouzikun")
 # agent 单轮最多步数（防止失控长跑烧钱）
 MAX_TURNS = int(os.environ.get("WECHAT_AGENT_MAX_TURNS", "12"))
 # 单轮整体超时（秒），超时给用户一句提示，不让一条慢消息卡死收消息循环
-TURN_TIMEOUT = int(os.environ.get("WECHAT_AGENT_TIMEOUT", "120"))
+# 180 是给多步探索任务（查会话/读多文件/分析）留余量——实测这类任务常跑到 120s+；
+# 普通对话 ~9s、单步工具 ~15-30s，远不会触顶。
+TURN_TIMEOUT = int(os.environ.get("WECHAT_AGENT_TIMEOUT", "180"))
 # 回复最长字符（微信长文体验差，超出截断）
 MAX_REPLY_LEN = 2000
 

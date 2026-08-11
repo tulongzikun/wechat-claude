@@ -20,6 +20,28 @@ def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
 
+# ---- 回复耗时预估（只用于决定要不要先发一条"请稍等"提示）----
+# 纯关键词规则、不调模型、零延迟，估不准也无妨——目的只是让用户在等较久任务时
+# 知道 bot 还活着。真正耗时仍由 agent 决定，这里只给个体感数字。
+_TOOL_WORDS = (
+    "查看", "查询", "搜索", "搜", "读取", "跑", "执行", "运行", "进程", "文件",
+    "日志", "目录", "统计", "找", "分析", "安装", "部署", "重启", "配置", "脚本",
+    "代码", "最新", "历史", "会话", "列表", "哪些", "所有", "比较", "检查", "监控",
+)
+# 预估超过这个值才先发提示（普通对话 ~9s，等得起就不打扰）
+HINT_THRESHOLD = 20
+
+
+def estimate_seconds(text: str) -> int:
+    """粗估这条消息的回复耗时（秒）。命中越多工具/多步关键词 → 越久。"""
+    hits = sum(1 for w in _TOOL_WORDS if w in text)
+    if hits == 0:
+        return 8            # 普通对话/知识问答
+    if hits <= 2:
+        return 30           # 单一工具任务（查个进程/读个文件）
+    return 60               # 多步探索任务（查会话最新回复/分析/对比）
+
+
 # 游标持久化：重启后接着上次的位置拉消息，避免服务端重复投递已处理的旧消息
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CURSOR_FILE = os.path.join(_DIR, "cursor.json")
@@ -84,6 +106,13 @@ def main() -> None:
                     reset_user(user_id)
                     reply = "已清空对话历史，可以重新开始啦 ✨"
                 else:
+                    # 预估耗时：较久的任务先回一条"预计 Xs"，免得用户干等以为没响应
+                    est = estimate_seconds(text)
+                    if est >= HINT_THRESHOLD:
+                        client.send_message(
+                            user_id, context_token,
+                            f"⏳ 这个问题要点时间，预计约 {est}s，请稍等…")
+                        print(f"{_ts()} ⏳ -> [{user_id}] 预估 {est}s，已先发提示")
                     reply = ask_claude(text, user_id)
 
                 # 3. 回复 —— context_token 原样带回（微信靠它路由到对应对话）
