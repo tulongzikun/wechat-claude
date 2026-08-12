@@ -7,6 +7,11 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$DIR/bot.log"
 PID="$DIR/bot.pid"
 
+# 用户环境（ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL 网关配置在 ~/.bashrc）：
+# start.sh 可能从干净环境（非交互 shell / cron / 重启）被调用，不能假设父 shell
+# 已加载过 .bashrc，所以主动 source。2>/dev/null 抑制噪音；|| true 防 set -e 退出。
+[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null || true
+
 # 可选：从同目录 .env 载入本地配置（不纳入版本控制，放 user_id 等本地值）
 if [ -f "$DIR/.env" ]; then
     set -a
