@@ -13,6 +13,9 @@ Agent SDK 会 spawn claude 子进程并继承这些变量，所以不需要单�
 
 import asyncio
 import os
+import threading
+import time
+import uuid
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -39,11 +42,23 @@ MAX_REPLY_LEN = 2000
 
 SYSTEM_PROMPT = (
     "你是一个运行在微信里的 AI 助手，托管在一台 Linux 服务器上，"
-    f"工作目录是 {AGENT_CWD}。用简洁、自然的中文回答，适合微信阅读。"
-    "\n\n【工具使用】按需合理调用：需要本机实时状态（查进程/读文件/跑命令/看日志）时，"
-    "该查就查、该多步就多步，以准确为先；只是不必为求'全面'反复查询同一信息。"
-    "而普通对话、知识问答、翻译、写作、建议这类——直接回答，不调用工具。"
-    "\n\n回复只写最终结论，省略工具过程；不要回复\"无法访问/无法查询\"。"
+    f"工作目录是 {AGENT_CWD}。用简洁、自然的中文回答，适合微信阅读。\n"
+    "\n"
+    "【本机已配置的东西】用户问起就据此回答，不要说\"没设置/没有\"：\n"
+    "- 这个 bot 本身：代码在 ~/workspace/wechat/（main.py 收发消息、claude.py 就是你这个 agent）。\n"
+    "- 每日定时任务：系统 cron 每天 17:00 跑 ~/workspace/wechat/daily_update.sh ——"
+    " fetch ~/workspace 下各项目的 mainline（master/main）更新，用 Claude 总结"
+    "「昨日17:00之后」的提交并推送微信。用 `crontab -l` 可核实。\n"
+    "- 后台作业：`/bg <任务>` 派后台长任务、`/jobs` 看进度、`重置` 清对话历史。\n"
+    "\n"
+    "【工具使用原则】\n"
+    "- 涉及本机状态的问题（\"有没有 / 装没装 / 是否设置 / 在不在跑 / 几点 / 在哪\"），"
+    "必须先用工具查证（Bash 跑 crontab -l / ls / ps，或读文件）再回答，"
+    "绝不凭记忆或直觉猜——查到什么答什么。\n"
+    "- 普通对话、知识问答、翻译、写作、建议——直接回答，不必调用工具。\n"
+    "- 确实查不到时，如实说\"没查到 / 不确定\"，不要编造答案。\n"
+    "\n"
+    "回复只写最终结论，省略工具过程。"
 )
 
 # 授权用户（全工具）：能读写文件、跑命令、联网
@@ -73,6 +88,49 @@ def _tools_for(user_id: str) -> list[str]:
 # 每个微信用户 -> agent session_id。首次为 None（开新会话），跑完一轮从
 # ResultMessage 拿到 session_id 后存起来，下一轮用 resume= 续上下文。
 _sessions: dict[str, str | None] = {}
+
+# ── 后台作业（机制 3）─────────────────────────────────────────────────────
+# 目的：长任务（多步探索 / 读别的 agent 产物再修订 / 回测）扔到工作线程里跑，
+# 主收消息循环不阻塞、不撞 180s 超时；完成后回调把结果推回微信。
+#
+# 关键约束：同一用户同时只能有一个 agent turn 在跑 —— 否则两个 turn 都 resume
+# 同一个 session_id 会冲突。所以用 per-user 锁串行化（inline 与后台共用）。
+
+_user_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _user_lock(user_id: str) -> threading.Lock:
+    """取（必要时建）某用户的锁。"""
+    with _locks_guard:
+        lk = _user_locks.get(user_id)
+        if lk is None:
+            lk = threading.Lock()
+            _user_locks[user_id] = lk
+        return lk
+
+
+# job_id -> {id, user_id, status, started, snippet, finished?}
+_jobs: dict[str, dict] = {}
+_jobs_guard = threading.Lock()
+_JOB_TTL = 3600  # 已完成作业保留 1 小时，超时清理，免得内存无限增长
+
+
+def list_jobs(user_id: str | None = None) -> list[dict]:
+    """列出作业（可选按 user 过滤）。顺带清理过期已完成作业。"""
+    now = time.time()
+    with _jobs_guard:
+        # 清理：完成超过 _JOB_TTL 的删掉
+        stale = [
+            jid for jid, j in _jobs.items()
+            if j.get("status") == "done" and now - j.get("finished", now) > _JOB_TTL
+        ]
+        for jid in stale:
+            del _jobs[jid]
+        items = [dict(j) for j in _jobs.values()]
+    if user_id:
+        items = [j for j in items if j.get("user_id") == user_id]
+    return items
 
 
 async def _agent_turn(
@@ -109,12 +167,11 @@ async def _agent_turn(
     return answer or "（agent 这一轮没有返回文本）", new_sid
 
 
-def ask_claude(text: str, user_id: str = "default") -> str:
-    """微信消息 -> agent 跑一轮 -> 回复文本。维护该 user_id 的 agent 会话。
+def _run_turn_sync(text: str, user_id: str) -> str:
+    """跑一轮 agent（含超时与 session 更新），返回给用户的文本。
 
-    main.py 是同步长轮询，这里用 asyncio.run 为每条消息起一个临时 event loop
-    驱动 agent；会话连续性靠 resume=<session_id> 维持（session 存在 claude 的
-    磁盘 transcript 里，跨 loop/进程可恢复）。
+    调用方必须已持有该 user 的锁——保证同一 session 不会被并发 resume。
+    每次新建临时 event loop 驱动 agent（可安全用于主线程外的后台线程）。
     """
     sid = _sessions.get(user_id)
     try:
@@ -122,7 +179,8 @@ def ask_claude(text: str, user_id: str = "default") -> str:
             asyncio.wait_for(_agent_turn(text, sid, user_id), timeout=TURN_TIMEOUT)
         )
     except asyncio.TimeoutError:
-        return f"⏳ 处理超时（>{TURN_TIMEOUT}s），换个简单点的问题再试。"
+        return (f"⏳ 处理超时（>{TURN_TIMEOUT}s）。"
+                f"这类长任务建议用 /bg <内容> 跑后台，不卡循环、不撞超时。")
     except Exception as e:
         return f"⚠️ agent 出错：{e}"
     if new_sid:
@@ -130,8 +188,78 @@ def ask_claude(text: str, user_id: str = "default") -> str:
     return answer
 
 
+def try_run_inline(text: str, user_id: str = "default") -> str | None:
+    """同步跑一轮（阻塞主线程），立刻返回回复。
+
+    适合短任务（普通对话 / 单步查询）。若该用户已有任务在跑，返回 None，
+    由调用方回复"忙"。返回 None 而非等待，是为了主收消息循环绝不卡死。
+    """
+    lk = _user_lock(user_id)
+    if not lk.acquire(blocking=False):
+        return None
+    try:
+        return _run_turn_sync(text, user_id)
+    finally:
+        lk.release()
+
+
+def submit_background(text: str, user_id: str, on_done) -> str | None:
+    """派一个后台作业跑 agent，完成时在工作线程里回调 on_done(result_text)。
+
+    主循环立即返回，不阻塞、不受 TURN_TIMEOUT 限制。返回 job_id；
+    若该用户已有任务在跑（锁被占），返回 None（调用方提示忙）。
+    on_done 在工作线程内执行，应只做"发回微信"这类线程安全的事。
+    """
+    lk = _user_lock(user_id)
+    if not lk.acquire(blocking=False):
+        return None
+
+    job_id = uuid.uuid4().hex[:8]
+    with _jobs_guard:
+        _jobs[job_id] = {
+            "id": job_id,
+            "user_id": user_id,
+            "status": "running",
+            "started": time.time(),
+            "snippet": text[:40],
+        }
+
+    def _worker():
+        result = ""
+        try:
+            result = _run_turn_sync(text, user_id)
+        except Exception as e:  # _run_turn_sync 已兜底，这里是双保险
+            result = f"⚠️ 后台作业异常：{e}"
+        finally:
+            lk.release()
+            with _jobs_guard:
+                if job_id in _jobs:
+                    _jobs[job_id]["status"] = "done"
+                    _jobs[job_id]["finished"] = time.time()
+            try:
+                on_done(result)
+            except Exception as e:
+                print(f"[bg {job_id}] on_done 回调失败：{e}")
+
+    threading.Thread(target=_worker, daemon=True, name=f"bg-{job_id}").start()
+    return job_id
+
+
+def ask_claude(text: str, user_id: str = "default") -> str:
+    """阻塞式跑一轮（自测/兼容用）。main.py 请用 try_run_inline / submit_background。"""
+    lk = _user_lock(user_id)
+    lk.acquire()  # 阻塞等待该用户的锁
+    try:
+        return _run_turn_sync(text, user_id)
+    finally:
+        lk.release()
+
+
 def reset_user(user_id: str) -> None:
-    """清空某用户的 agent 会话（用户发"重置"时调用，下条消息开新会话）。"""
+    """清空某用户的 agent 会话（用户发"重置"时调用，下条消息开新会话）。
+
+    注意：若该用户正好有后台作业在跑，在跑的 turn 会把自己的 session 写回，
+    可能把重置覆盖掉——所以重置最好在没有 /jobs 进行时发。"""
     _sessions.pop(user_id, None)
 
 

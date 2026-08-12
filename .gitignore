@@ -7,6 +7,17 @@ bot.pid
 qr.png
 qr_url.txt
 
+# 含真实 user_id + context_token（bot 每收一条消息落盘）
+latest_ctx.json
+# 历史增量 SHA（已改成无状态时间窗口，弃用，保险忽略）
+update_state.json
+
+# 所有日志（含 cron 的 daily_update.log）
+*.log
+
+# 临时/原子写文件
+*.tmp
+
 # Python
 __pycache__/
 *.pyc

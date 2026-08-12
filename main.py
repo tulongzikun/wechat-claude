@@ -10,7 +10,7 @@ import json
 import os
 import time
 
-from claude import ask_claude, reset_user
+from claude import list_jobs, reset_user, submit_background, try_run_inline
 from ilink import ILinkClient
 from login import load_token, login
 
@@ -30,6 +30,8 @@ _TOOL_WORDS = (
 )
 # 预估超过这个值才先发提示（普通对话 ~9s，等得起就不打扰）
 HINT_THRESHOLD = 20
+# 预估超过这个值 → 直接转后台跑（不阻塞主循环、不撞 agent 180s 超时）
+BG_THRESHOLD = 40
 
 
 def estimate_seconds(text: str) -> int:
@@ -71,6 +73,51 @@ def extract_text(msg: dict) -> str:
         return ""
 
 
+# 每个用户最近一次入站消息的 context_token。后台作业完成时用它把结果推回微信
+# （后台作业跨越多条消息，不能只锁死派发那一刻的 token——用最新的路由更稳）。
+_latest_ctx: dict[str, str] = {}
+
+# 把 latest_ctx 落盘，供【外部定时任务】（如每日 17:00 的项目更新推送）读取——
+# 那些任务在 bot 进程外运行，要主动推送就得有可路由的 context_token。
+_LATEST_CTX_FILE = os.path.join(_DIR, "latest_ctx.json")
+
+
+def _save_latest_ctx() -> None:
+    try:
+        with open(_LATEST_CTX_FILE, "w", encoding="utf-8") as f:
+            json.dump(_latest_ctx, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def push_back(client: ILinkClient, user_id: str, text: str) -> None:
+    """后台作业完成后，用该用户最新的 context_token 把结果推回微信。"""
+    ctx = _latest_ctx.get(user_id)
+    if not ctx:
+        print(f"{_ts()} ⚠️ [{user_id}] 无可用 context_token，后台结果无法回推")
+        return
+    try:
+        client.send_message(user_id, ctx, text)
+        print(f"{_ts()} 📨 -> [{user_id}] (后台回推) "
+              f"{text[:60]}{'...' if len(text) > 60 else ''}")
+    except Exception as e:
+        print(f"{_ts()} ⚠️ [{user_id}] 后台回推失败：{e}")
+
+
+_BG_PREFIXES = ("/bg ", "后台:", "后台：")
+
+
+def is_bg_command(stripped: str) -> bool:
+    return any(stripped.startswith(p) for p in _BG_PREFIXES)
+
+
+def parse_bg_task(stripped: str) -> str:
+    for p in _BG_PREFIXES:
+        if stripped.startswith(p):
+            return stripped[len(p):].strip()
+    return stripped
+
+
 def main() -> None:
     # 1. 拿 token（本地有就用本地的，没有就走扫码登录）
     token_data = load_token()
@@ -99,25 +146,81 @@ def main() -> None:
 
                 context_token = msg.get("context_token", "")
                 user_id = msg.get("from_user_id", "")
+                _latest_ctx[user_id] = context_token  # 后台作业回推要用最新的
+                _save_latest_ctx()                    # 落盘，供外部定时推送任务用
+                stripped = text.strip()
                 print(f"{_ts()} 👤 [{user_id}] {text}")
 
-                # 简单指令：发"重置"清空该用户的对话历史
-                if text.strip() in ("重置", "reset", "/reset"):
-                    reset_user(user_id)
-                    reply = "已清空对话历史，可以重新开始啦 ✨"
-                else:
-                    # 预估耗时：较久的任务先回一条"预计 Xs"，免得用户干等以为没响应
-                    est = estimate_seconds(text)
-                    if est >= HINT_THRESHOLD:
-                        client.send_message(
-                            user_id, context_token,
-                            f"⏳ 这个问题要点时间，预计约 {est}s，请稍等…")
-                        print(f"{_ts()} ⏳ -> [{user_id}] 预估 {est}s，已先发提示")
-                    reply = ask_claude(text, user_id)
+                # ---- 指令分流 ----
 
-                # 3. 回复 —— context_token 原样带回（微信靠它路由到对应对话）
-                client.send_message(user_id, context_token, reply)
-                print(f"{_ts()} 🤖 -> [{user_id}] {reply[:60]}{'...' if len(reply) > 60 else ''}")
+                # /reset：清空该用户的 agent 会话
+                if stripped in ("重置", "reset", "/reset"):
+                    reset_user(user_id)
+                    client.send_message(user_id, context_token,
+                                        "已清空对话历史，可以重新开始啦 ✨")
+
+                # /jobs：看自己的后台作业状态
+                elif stripped in ("/jobs", "任务", "作业", "/status"):
+                    running = [j for j in list_jobs(user_id)
+                               if j.get("status") == "running"]
+                    if running:
+                        body = "\n".join(
+                            f"• job={j['id']}（{j.get('snippet', '')}）" for j in running)
+                        client.send_message(user_id, context_token,
+                                            "🔄 进行中的后台作业：\n" + body)
+                    else:
+                        client.send_message(user_id, context_token,
+                                            "没有正在跑的后台作业。")
+
+                # /bg <任务>：显式后台跑
+                elif is_bg_command(stripped):
+                    task = parse_bg_task(stripped)
+                    if not task:
+                        client.send_message(user_id, context_token,
+                                            "用法：/bg <要办的事>，例如 /bg 读 novel/outline.md 并续写第三章")
+                        continue
+                    job_id = submit_background(
+                        task, user_id,
+                        on_done=lambda r, uid=user_id: push_back(
+                            client, uid, f"✅ 后台任务完成：\n{r}"),
+                    )
+                    if job_id is None:
+                        client.send_message(user_id, context_token,
+                                            "⏳ 上一条还在跑，等它完成（/jobs 看状态）或发「重置」后再试。")
+                    else:
+                        client.send_message(user_id, context_token,
+                                            f"🚀 已派后台 job={job_id}，跑完发回这里。\n任务：{task[:80]}")
+                        print(f"{_ts()} 🚀 -> [{user_id}] 后台 job={job_id}：{task[:60]}")
+
+                else:
+                    est = estimate_seconds(text)
+                    if est >= BG_THRESHOLD:
+                        # 预估较久 → 自动转后台，主循环不阻塞、不撞 agent 超时
+                        job_id = submit_background(
+                            text, user_id,
+                            on_done=lambda r, uid=user_id: push_back(
+                                client, uid, f"✅ 完成：\n{r}"),
+                        )
+                        if job_id is None:
+                            client.send_message(user_id, context_token,
+                                                "⏳ 上一条还在跑，等它完成或发「重置」。")
+                        else:
+                            client.send_message(user_id, context_token,
+                                                f"⏳ 这个要点时间，已转后台 job={job_id}，跑完发回。")
+                            print(f"{_ts()} ⏳ -> [{user_id}] 自动转后台 job={job_id}（est={est}s）")
+                    else:
+                        # 短任务：同步跑（仅短暂阻塞主循环）
+                        if est >= HINT_THRESHOLD:
+                            client.send_message(user_id, context_token,
+                                                f"⏳ 预计约 {est}s，稍等…")
+                        reply = try_run_inline(text, user_id)
+                        if reply is None:
+                            client.send_message(user_id, context_token,
+                                                "⏳ 上一条还在处理，等完成或发「重置」。")
+                        else:
+                            client.send_message(user_id, context_token, reply)
+                            print(f"{_ts()} 🤖 -> [{user_id}] "
+                                  f"{reply[:60]}{'...' if len(reply) > 60 else ''}")
 
         except KeyboardInterrupt:
             print("\n👋 收到退出信号，Bye~")
