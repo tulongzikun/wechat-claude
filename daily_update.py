@@ -8,7 +8,7 @@
 - **窗口语义**：每次报告【昨日 17:00 之后落到 mainline 的所有 commit】（按 committer
   date），不依赖 fetch 时机 / 手动重跑——即便某 commit 之前已被 fetch、也已出现在
   origin/master，只要其提交时间在窗口内就照常总结。这是确定的日历窗口，无状态。
-- 每个仓库按 mainline 分支（origin/HEAD → master → main）。
+- 每个仓库按 mainline 分支（origin/master → main，**不看 origin/HEAD**）。
 - 用 anthropic SDK 总结（自动走 ANTHROPIC_BASE_URL 网关 + ANTHROPIC_AUTH_TOKEN，
   模型用 HAIKU，便宜够用）。
 - 推送走 ilink.ILinkClient + token.json；收件人 = WECHAT_ADMIN_USERS，
@@ -95,10 +95,12 @@ def git(repo: Path, *args: str) -> tuple[int, str]:
 
 
 def default_branch(repo: Path) -> str | None:
-    """该仓库的 mainline 分支：origin/HEAD → master → main，都没有返回 None。"""
-    rc, out = git(repo, "symbolic-ref", "refs/remotes/origin/HEAD")
-    if rc == 0 and out:
-        return out.rsplit("origin/", 1)[-1].strip()
+    """该仓库的 mainline 分支：origin/master → origin/main（取存在的第一个），都没有返回 None。
+
+    故意不看 origin/HEAD——它是「当前 checkout 的远程默认分支」，某些仓会指向 docs/
+    feature 分支（如 notes 指向 docs/ic-daily-global），那样会漏掉真正主线上的提交。
+    统一以 origin/master（兜底 main）为每个仓的主线。
+    """
     for b in ("master", "main"):
         rc, _ = git(repo, "rev-parse", "--verify", f"origin/{b}")
         if rc == 0:
