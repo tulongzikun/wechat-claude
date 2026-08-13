@@ -25,9 +25,6 @@ import sys
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
-from ilink import ILinkClient
-
 DIR = Path(__file__).resolve().parent
 WORKSPACE = Path.home() / "workspace"
 LATEST_CTX_FILE = DIR / "latest_ctx.json"   # {user_id: context_token}（bot 落盘）
@@ -63,14 +60,23 @@ def load_json(path: Path, default):
 
 # ---------- 时间窗口 ----------
 
-def since_yesterday_5pm() -> str:
-    """昨日 17:00 的本地时间字符串（报告窗口起点）。
+# 报告时区由 daily_update.sh 的 `export TZ="${CRON_TZ:-Asia/Shanghai}"` 设定，
+# 复用 cron 注入的 CRON_TZ（cronie 已实测会传进 job 环境），与 cron 触发时区一致——
+# 单一来源、零硬编码：换时区只改 crontab 的 CRON_TZ，脚本无需改动。
+# 下午 5 点是「每日报告」的业务锚点。
+REPORT_HOUR = 17
 
-    cron 每天 17:00 跑 → 窗口恰好是最近 24h。按本地时间（服务器 America/New_York）。
+
+def since_yesterday_5pm() -> str:
+    """报告时区的昨日 17:00（窗口起点）。
+
+    时区由进程 TZ 决定（= cron 的 CRON_TZ，默认 Asia/Shanghai），与 cron 触发点对齐
+    成完整 24h。返回 naive 时间串，`git log --since` 按进程 TZ 解释——所以不写死
+    offset、不依赖具体地区，换时区零改动。
     """
-    now = datetime.datetime.now()
+    now = datetime.datetime.now()  # naive，按 TZ env（= CRON_TZ）
     y = (now - datetime.timedelta(days=1)).replace(
-        hour=17, minute=0, second=0, microsecond=0)
+        hour=REPORT_HOUR, minute=0, second=0, microsecond=0)
     return y.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -164,6 +170,7 @@ def summarize(updates: list[dict], since: str) -> str | None:
         f"提交记录：\n{raw}"
     )
 
+    from anthropic import Anthropic  # 延迟 import：顶部不加载重模块
     client = Anthropic()  # 自动用 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL
     r = client.messages.create(
         model=MODEL, max_tokens=1500,
@@ -196,6 +203,7 @@ def push(text: str) -> int:
     if not tok.get("token"):
         log("❌ token.json 无 bot token，无法推送")
         return 0
+    from ilink import ILinkClient  # 延迟 import
     client = ILinkClient(bot_token=tok["token"], baseurl=tok.get("baseurl", ""))
     sent = 0
     for uid, ctok in recipients():
@@ -211,7 +219,8 @@ def push(text: str) -> int:
 def main() -> None:
     log(f"=== 每日项目更新摘要 开始{'（dry-run）' if DRY_RUN else ''} ===")
     since = since_yesterday_5pm()
-    log(f"报告窗口起点：{since}（昨日17:00，本地时间）")
+    tz_name = os.environ.get("TZ", "(未设TZ)")
+    log(f"报告窗口起点：{since}（{tz_name} 昨日17:00）")
     updates = collect_updates(since)
     summary = summarize(updates, since)
 

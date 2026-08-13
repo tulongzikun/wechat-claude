@@ -26,5 +26,10 @@ fi
 # 3) PATH：确保 git / python / claude 能找到
 export PATH="$HOME/.local/bin:$PATH"
 
+# 4) 时区：复用 cron 注入的 CRON_TZ（cronie 会把它传进 job 环境，已实测），
+#    让脚本里的 datetime / `git --since` 都按这个时区；手动跑无 CRON_TZ 时默认上海。
+#    单一来源——换时区只改 crontab 的 CRON_TZ，这里和 daily_update.py 都零硬编码。
+export TZ="${CRON_TZ:-Asia/Shanghai}"
+
 cd "$DIR"
 exec python3 "$DIR/daily_update.py" "$@"
