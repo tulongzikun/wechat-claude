@@ -44,6 +44,19 @@ bot 与 jobs 的关系：bot 负责微信通讯（被动回复 + 把每个用户
 推送时读 bot 落盘的 token 走 ilink，优先走企业微信群机器人 webhook
 （`.env` 的 `WECOM_WEBHOOK`，无需 token、无条件主动推）。
 
+## 推送通道（jobs/ 定时任务）
+
+定时推送走两条**可独立配置**的通道，`push()` 会各推一份、互不影响：
+
+| 通道 | 配置（`.env`） | 到达条件 | 特点 |
+|---|---|---|---|
+| 企业微信群机器人 | `WECOM_WEBHOOK`（群聊「···」→群机器人→添加，复制 webhook 地址） | 无条件 | 主动推、不依赖互动；markdown 上限 4096 字节；仅内部群可用；~20 条/分钟 |
+| 个人微信（ilink） | `WECHAT_ADMIN_USERS`（收件人 user_id 列表） | 24h 内给 bot 发过消息 | 与 bot 对话同一路径，`context_token` 约 24h 时效，过期当天只在企微群收到 |
+
+- 只想要企微：留空 `WECHAT_ADMIN_USERS` 之外无需其他操作（ilink 找不到 token 自动跳过）。
+- 只想要微信：留空 `WECOM_WEBHOOK` 即回退纯 ilink。
+- webhook 地址和 user_id 都是敏感信息，只放 `.env`（gitignore，不入库）。
+
 ## 安装
 
 ```bash
