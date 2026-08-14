@@ -200,7 +200,40 @@ def recipients() -> list[tuple[str, str]]:
     return out
 
 
+def push_wecom(text: str) -> int:
+    """企业微信群机器人 webhook 推送（markdown）。成功返回 1，未配置/失败返回 0。
+
+    主动推送、无 context_token 依赖——ilink 的 24h token 过期问题在这里不存在。
+    webhook 从 .env 的 WECOM_WEBHOOK 读。markdown content 上限 4096 字节，
+    超长按字节安全截断（decode ignore 避免半个 UTF-8 字符）。
+    """
+    hook = os.environ.get("WECOM_WEBHOOK", "")
+    if not hook:
+        return 0
+    import requests  # 延迟 import
+    b = text.encode("utf-8")
+    content = text if len(b) <= 4000 else b[:4000].decode("utf-8", "ignore") + "\n…(已截断)"
+    try:
+        r = requests.post(hook, json={"msgtype": "markdown",
+                                      "markdown": {"content": content}}, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("errcode") != 0:
+            log(f"  ⚠️ 企微推送失败: {d}")
+            return 0
+        log("  📨 已推送 -> 企微群机器人")
+        return 1
+    except Exception as e:
+        log(f"  ⚠️ 企微推送失败: {e}")
+        return 0
+
+
 def push(text: str) -> int:
+    # 1) 优先企业微信群机器人 webhook（主动推送，不依赖用户互动 / context_token）
+    if push_wecom(text):
+        return 1
+    log("  ⚠️ 企微通道不可用，回退 ilink（需 24h 内有互动）…")
+    # 2) 回退 ilink：context_token 来自 latest_ctx.json（bot 落盘），约 24h 时效
     tok = load_json(TOKEN_FILE, {})
     if not tok.get("token"):
         log("❌ token.json 无 bot token，无法推送")
@@ -210,7 +243,14 @@ def push(text: str) -> int:
     sent = 0
     for uid, ctok in recipients():
         try:
-            client.send_message(uid, ctok, text)
+            r = client.send_message(uid, ctok, text)
+            ret = r.get("ret", 0) if isinstance(r, dict) else 0
+            if ret != 0:
+                # send_message 只在 HTTP 层 raise（raise_for_status），业务错误在 json 里：
+                # ret=-2 "prepare failed" = context_token 过期（约 24h 时效）
+                log(f"  ⚠️ 推送 {uid} 失败: ret={ret} {r.get('errmsg', '')}"
+                    "（多半是 context_token 过期——先给 bot 发条消息刷新 latest_ctx）")
+                continue
             sent += 1
             log(f"  📨 已推送 -> {uid}")
         except Exception as e:
