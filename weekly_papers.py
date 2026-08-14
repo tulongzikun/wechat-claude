@@ -7,8 +7,9 @@
 - 数据源 arXiv q-fin（cat:q-fin*），走 https（本机 80 端口封、443 通）。
 - 窗口 = 报告时区（TZ env = CRON_TZ，默认 Asia/Shanghai）的上个自然周
   （周一 00:00 ~ 周日 23:59）。周一 10:00 推送时正好覆盖刚结束的完整上周。
-- 六主题关键词粗筛（期货/股票/趋势/多因子/择时/量化），再让 Claude 按主题分组
-  中文总结，每篇一句点评 + arXiv 链接。
+- 六主题关键词粗筛（期货/股票/趋势/多因子/择时/量化），再让 Claude 按影响力
+  （创新性/实盘相关性/跨学科可迁移性——新论文无引用数据的代理）精选 Top10，
+  按主题分组中文总结，每篇一句点评 + arXiv 链接。
 - 推送直接复用 daily_update.push（ilink + token.json + latest_ctx.json）。
 
 调试：python3 weekly_papers.py --dry-run   只抓+筛+总结+打印，不推送。
@@ -153,16 +154,19 @@ def summarize(hits, start, end) -> str | None:
         )
     raw = "\n\n".join(items)
     win = f"{start:%m-%d}~{end - datetime.timedelta(days=1):%m-%d}"
+    top_n = min(10, len(capped))
     prompt = (
         f"下面是上周（{win}）arXiv q-fin 中命中【期货/股票/趋势交易/多因子/择时/量化模型】"
         f"主题的 {len(capped)} 篇论文（标题/主题标签/分类/摘要/链接）。\n"
-        "请生成一份给微信看的【每周论文速递】，要求：\n"
-        "1. 开头一句总体概述：这周量化金融主要在推进哪些方向。\n"
-        "2. 按主题分节：期货 / 股票 / 趋势交易 / 多因子 / 择时 / 量化模型。"
-        "每篇论文归入最相关的一个主题（不重复列）；某主题无论文就略过。\n"
-        "3. 每篇格式：「一句中文点评（做了什么、结论/价值）」后跟该篇 arXiv 链接。\n"
-        "4. 合并同义/重复工作；跳过与六个主题无关的纯数学推导。\n"
-        "5. 用 markdown 列表，控制在 1500 字内，适合手机阅读。\n\n"
+        "请生成一份给微信看的【每周论文速递 Top10】，要求：\n"
+        f"1. 只挑影响力/价值最大的 {top_n} 篇——新论文没有引用数据，按以下代理判断："
+        "创新性（是否提出新方法/新结论而非增量改进）、与实盘量化交易的相关度和实用性、"
+        "交叉列出 cs.LG/stat.ML 等且方法可迁移的优先。\n"
+        "2. 开头一句总体概述：这周量化金融主要在推进哪些方向。\n"
+        "3. 按主题分节：期货 / 股票 / 趋势交易 / 多因子 / 择时 / 量化模型；"
+        "每篇归入最相关的一个主题，标注 [排名]，未入选的不再提及。\n"
+        "4. 每篇格式：「一句中文点评（做了什么、结论/价值、为什么重要）」后跟 arXiv 链接。\n"
+        "5. 用 markdown 列表，控制在 1200 字内，适合手机阅读、绝不能被截断。\n\n"
         f"论文列表：\n{raw}"
     )
     from anthropic import Anthropic  # 延迟 import
@@ -199,8 +203,10 @@ def main() -> None:
         push(msg)
         return
 
-    header = (f"📚 每周论文速递（{win}）\n"
-              f"arXiv q-fin 命中 {len(hits)}/{total} 篇（{', '.join(TOPIC_ORDER)}）")
+    top_n = min(10, len(hits))
+    header = (f"📚 每周论文速递 Top{top_n}（{win}）\n"
+              f"arXiv q-fin 命中 {len(hits)}/{total} 篇，精选 {top_n} 篇"
+              f"（{', '.join(TOPIC_ORDER)}）")
     full = header + "\n\n" + summary
     if len(full) > MAX_REPLY_LEN:
         full = full[:MAX_REPLY_LEN] + "\n…(已截断)"
