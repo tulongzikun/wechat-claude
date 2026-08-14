@@ -228,15 +228,11 @@ def push_wecom(text: str) -> int:
         return 0
 
 
-def push(text: str) -> int:
-    # 1) 优先企业微信群机器人 webhook（主动推送，不依赖用户互动 / context_token）
-    if push_wecom(text):
-        return 1
-    log("  ⚠️ 企微通道不可用，回退 ilink（需 24h 内有互动）…")
-    # 2) 回退 ilink：context_token 来自 latest_ctx.json（bot 落盘），约 24h 时效
+def push_ilink(text: str) -> int:
+    """ilink 微信推送。context_token 来自 latest_ctx.json（bot 落盘），约 24h 时效。"""
     tok = load_json(TOKEN_FILE, {})
     if not tok.get("token"):
-        log("❌ token.json 无 bot token，无法推送")
+        log("⚠️ token.json 无 bot token，跳过 ilink 通道")
         return 0
     from ilink import ILinkClient  # 延迟 import
     client = ILinkClient(bot_token=tok["token"], baseurl=tok.get("baseurl", ""))
@@ -252,9 +248,25 @@ def push(text: str) -> int:
                     "（多半是 context_token 过期——先给 bot 发条消息刷新 latest_ctx）")
                 continue
             sent += 1
-            log(f"  📨 已推送 -> {uid}")
+            log(f"  📨 已推送 -> 微信 {uid}")
         except Exception as e:
             log(f"  ⚠️ 推送 {uid} 失败: {e}")
+    return sent
+
+
+def push(text: str) -> int:
+    """双通道同步推送：企微群 webhook + ilink 个人微信，各推一份、互不影响。
+
+    企微是主动通道（无条件成功）；ilink 需 24h 内有互动，过期只降级不阻断。
+    返回成功通道数（0=两个都没送达）。
+    """
+    sent = 0
+    # 1) 企业微信群机器人 webhook——主动推送，不依赖用户互动 / context_token
+    if push_wecom(text):
+        sent += 1
+    # 2) ilink——个人微信同步一份；token 过期只是少了这份，不影响企微结果
+    if push_ilink(text):
+        sent += 1
     return sent
 
 
