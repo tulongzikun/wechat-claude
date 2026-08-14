@@ -25,21 +25,38 @@
 
 ```
 wechat/
-├── main.py            # 主循环：iLink 收消息 → agent → 发回复
-├── claude.py          # Claude Agent SDK 后端（per-user agent 会话 + 工具分层）
-├── ilink.py           # iLink API 客户端（扫码 / 收消息 / 发消息）
-├── login.py           # 扫码登录 + token 持久化
-├── start.sh / stop.sh # 后台常驻启停
-├── .env.example       # 本地配置模板（复制为 .env）
+├── bot/               # 微信通讯层：iLink 收发 + Claude agent
+│   ├── main.py        #   主循环：iLink 收消息 → agent → 发回复
+│   ├── claude.py      #   Claude Agent SDK 后端（per-user agent 会话 + 工具分层）
+│   ├── ilink.py       #   iLink API 客户端（扫码 / 收消息 / 发消息）
+│   ├── login.py       #   扫码登录 + token 持久化
+│   └── start.sh / stop.sh   # 后台常驻启停
+├── jobs/              # 定时任务层（cron 调用，主动推送）
+│   ├── daily_update.py / .sh   # 每天 17:00：workspace 各仓 mainline 提交摘要
+│   └── weekly_papers.py / .sh  # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
+├── .env.example       # 本地配置模板（复制为 .env，bot 和 jobs 共用）
 ├── requirements.txt
 └── README.md
 ```
+
+bot 与 jobs 的关系：bot 负责微信通讯（被动回复 + 把每个用户的
+`context_token` 落盘到 `bot/latest_ctx.json`）；jobs 是独立进程的定时任务，
+推送时读 bot 落盘的 token 走 ilink，优先走企业微信群机器人 webhook
+（`.env` 的 `WECOM_WEBHOOK`，无需 token、无条件主动推）。
 
 ## 安装
 
 ```bash
 cd wechat
 pip install -r requirements.txt      # 含 claude-agent-sdk（捆绑原生 claude 二进制）
+```
+
+定时任务挂 crontab（见 `jobs/*.sh` 头部注释；`CRON_TZ=Asia/Shanghai`）：
+
+```
+CRON_TZ=Asia/Shanghai
+0 17 * * * /path/to/wechat/jobs/daily_update.sh  >> /path/to/wechat/jobs/daily_update.log 2>&1
+0 10 * * 1 /path/to/wechat/jobs/weekly_papers.sh >> /path/to/wechat/jobs/weekly_papers.log 2>&1
 ```
 
 ## 配置
@@ -64,9 +81,12 @@ cp .env.example .env
 ## 运行
 
 ```bash
-bash start.sh     # 后台常驻（setsid + nohup，脱离终端）
-tail -f bot.log   # 看日志
-bash stop.sh      # 停止
+bash bot/start.sh      # 后台常驻（setsid + nohup，脱离终端）
+tail -f bot/bot.log    # 看日志
+bash bot/stop.sh       # 停止
+
+bash jobs/daily_update.sh  --dry-run   # 定时任务试跑（只打印不推送）
+bash jobs/weekly_papers.sh --dry-run
 ```
 
 首次运行会生成二维码（`qr.png`），**在手机微信里**扫码登录（二维码页依赖

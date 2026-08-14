@@ -15,11 +15,11 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1090
 [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
 
-# 2) 项目本地 .env（export 其中的变量，如 WECHAT_ADMIN_USERS）
-if [ -f "$DIR/.env" ]; then
+# 2) 项目本地 .env（在仓库根目录 = jobs/ 上一层；export 其中变量）
+if [ -f "$DIR/../.env" ]; then
     set -a
     # shellcheck disable=SC1091
-    source "$DIR/.env"
+    source "$DIR/../.env"
     set +a
 fi
 

@@ -13,6 +13,8 @@
   模型用 HAIKU，便宜够用）。
 - 推送走 ilink.ILinkClient + token.json；收件人 = WECHAT_ADMIN_USERS，
   context_token 从 latest_ctx.json 取（bot 每次收消息时落盘）。
+- 目录分层：本文件在 jobs/（定时任务），微信通讯层在 ../bot/
+  （token.json / latest_ctx.json / ilink.py 都在那边）。
 
 调试：python3 daily_update.py --dry-run   只 fetch+总结+打印，不推送。
 """
@@ -25,10 +27,14 @@ import sys
 import time
 from pathlib import Path
 
-DIR = Path(__file__).resolve().parent
+DIR = Path(__file__).resolve().parent          # jobs/（定时任务层）
+BOT_DIR = DIR.parent / "bot"                   # bot/（微信通讯层，token / latest_ctx 在这里）
 WORKSPACE = Path.home() / "workspace"
-LATEST_CTX_FILE = DIR / "latest_ctx.json"   # {user_id: context_token}（bot 落盘）
-TOKEN_FILE = DIR / "token.json"
+LATEST_CTX_FILE = BOT_DIR / "latest_ctx.json"  # {user_id: context_token}（bot 落盘）
+TOKEN_FILE = BOT_DIR / "token.json"
+
+# ilink 客户端在 bot/ 下，push 回退要用（sys.path 是给延迟 import `from ilink import ...` 的）
+sys.path.insert(0, str(BOT_DIR))
 
 FETCH_TIMEOUT = 60            # 单仓库 fetch 超时
 MAX_COMMITS_PER_REPO = 30     # 每仓库喂给模型的提交上限（防超长）

@@ -12,10 +12,10 @@ PID="$DIR/bot.pid"
 # 已加载过 .bashrc，所以主动 source。2>/dev/null 抑制噪音；|| true 防 set -e 退出。
 [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null || true
 
-# 可选：从同目录 .env 载入本地配置（不纳入版本控制，放 user_id 等本地值）
-if [ -f "$DIR/.env" ]; then
+# 可选：从仓库根目录 .env 载入本地配置（不纳入版本控制，放 user_id 等本地值）
+if [ -f "$DIR/../.env" ]; then
     set -a
-    . "$DIR/.env"
+    . "$DIR/../.env"
     set +a
 fi
 
