@@ -84,10 +84,18 @@ JUNK_RE = re.compile(
 DRY_RUN = "--dry-run" in sys.argv
 
 # ---------- hsr.nanoka.cc 星铁未实装新角色（静态 JSON 数据库） ----------
-# 站点是 SvelteKit SPA，真实数据在 static.nanoka.cc：版本号从首页 HTML 里
-# 正则提取（随官方版本更新），失败回落内置版本。release=0/未定 = 未实装。
-NANOKA_HOME = "https://hsr.nanoka.cc/"
-NANOKA_VER_FALLBACK = "4.4.54"
+# 站点是 SvelteKit SPA，真实数据在 static.nanoka.cc：
+#   /manifest.json                       → 各游戏 latest/live 版本号
+#   /hsr/<ver>/character.json            → 全角色索引（无 release 字段=未实装）
+#   /hsr/<ver>/zh/character/<id>.json    → 单角色中文详情（技能/星魂/忆灵/背景）
+NANOKA_STATIC = "https://static.nanoka.cc"
+NANOKA_VER_FALLBACK = "4.4.55"
+
+# 内部名 → 中文（base_type 命途 / damage_type 属性）
+PATH_ZH = {"Warrior": "毁灭", "Knight": "存护", "Rogue": "巡猎", "Mage": "智识",
+           "Shaman": "丰饶", "Priest": "虚无", "Memory": "记忆", "Elation": "欢愉"}
+ELEM_ZH = {"Physical": "物理", "Fire": "火", "Ice": "冰", "Lightning": "雷",
+           "Thunder": "雷", "Wind": "风", "Quantum": "量子", "Imaginary": "虚数"}
 
 
 def http_get(url: str, timeout: int = FETCH_TIMEOUT) -> bytes:
@@ -96,33 +104,65 @@ def http_get(url: str, timeout: int = FETCH_TIMEOUT) -> bytes:
         return r.read()
 
 
+def _clean(text: str) -> str:
+    """去富文本标签（<color>/<u>/<unbreak>）和数值占位符（#3[i]%）。"""
+    t = re.sub(r"<[^>]+>", "", text or "")
+    return re.sub(r"#\d+\[[a-z%]*\]", "", t).strip()
+
+
+def _nanoka_version() -> str:
+    try:
+        m = json.loads(http_get(f"{NANOKA_STATIC}/manifest.json"))
+        return m["hsr"]["latest"]
+    except Exception:
+        return NANOKA_VER_FALLBACK
+
+
 def fetch_nanoka_upcoming() -> list[str]:
-    """星铁未实装新角色列表（名字/星级/命途/属性/背景梗概）。失败返回 []。"""
-    ver = NANOKA_VER_FALLBACK
+    """星铁未实装新角色完整档案（技能组/星魂/忆灵），供模型写定位+机制。"""
+    ver = _nanoka_version()
     try:
-        m = re.search(rb"static\.nanoka\.cc/hsr/([\d.]+)/character\.json", http_get(NANOKA_HOME))
-        if m:
-            ver = m.group(1).decode()
-    except Exception as e:
-        log(f"  ⚠️ nanoka 首页抓取失败: {e}")
-    try:
-        data = json.loads(http_get(f"https://static.nanoka.cc/hsr/{ver}/character.json"))
+        index = json.loads(http_get(f"{NANOKA_STATIC}/hsr/{ver}/character.json"))
     except Exception as e:
         log(f"  ⚠️ nanoka character.json（{ver}）抓取失败: {e}")
         return []
     now = time.time()
+    upcoming = [(cid, c) for cid, c in sorted(index.items())
+                if not c.get("release") or c["release"] > now]
     lines = []
-    for cid, c in sorted(data.items()):
-        rel = c.get("release", 0)
-        if rel and rel <= now:   # 已实装跳过；未定档（rel=0）保留
-            continue
+    for cid, c in upcoming[:4]:   # 上限 4 名，防极端版本膨胀
         star = re.search(r"(\d)$", c.get("rank", ""))
-        lines.append(
-            f"- {c.get('zh', '?')}（{c.get('en', '?')}）"
-            f"{star.group(1) if star else '?'}星 命途:{c.get('baseType', '?')} "
-            f"属性:{c.get('damageType', '?')} 上线未定档。"
-            f"背景：{(c.get('desc') or '').replace(chr(10), ' ')[:200]}")
-    log(f"  nanoka：未实装新角色 {len(lines)} 名")
+        head = (f"### {c.get('zh', '?')}（{c.get('en', '?')}）"
+                f"{star.group(1) if star else '?'}星 "
+                f"{PATH_ZH.get(c.get('baseType'), c.get('baseType', '?'))}·"
+                f"{ELEM_ZH.get(c.get('damageType'), c.get('damageType', '?'))}，上线未定档")
+        block = [head]
+        try:
+            d = json.loads(http_get(
+                f"{NANOKA_STATIC}/hsr/{ver}/zh/character/{cid}.json"))
+        except Exception as e:
+            log(f"  ⚠️ nanoka 详情（{cid}）抓取失败: {e}")
+            block.append(f"  简介：{_clean(c.get('desc'))[:150]}")
+            lines.append("\n".join(block))
+            continue
+        if d.get("sp_need"):
+            block[0] += f"，能量{d['sp_need']}"
+        for s in d.get("skills", {}).values():
+            name, desc = s.get("name", ""), _clean(s.get("simple_desc") or s.get("desc") or "")
+            if not name or not desc:
+                continue   # 跳过空壳（如普攻第二形态占位）
+            block.append(f"  - {s.get('type_name', '技能')}「{name}」：{desc[:140]}")
+        memo = d.get("memosprite") or {}
+        if memo.get("name"):
+            block.append(f"  - 忆灵「{memo['name']}」（记忆命途召唤物，技能："
+                         + "、".join(_clean(s.get("name", "")) for s in memo.get("skills", {}).values())
+                         + "）")
+        for r in ("1", "6"):
+            rk = (d.get("ranks") or {}).get(r)
+            if rk and rk.get("name"):
+                block.append(f"  - 星魂{r}「{rk['name']}」：{_clean(rk.get('desc', ''))[:90]}")
+        lines.append("\n".join(block))
+    log(f"  nanoka：未实装新角色 {len(upcoming)} 名（版本 {ver}，取 {len(lines)}）")
     return lines
 
 
@@ -241,10 +281,12 @@ def summarize(news: dict[str, list[dict]], start, end,
         "机制数值/联动对象/上线时间等关键信息尽量写全）。**不要输出任何链接或 URL**，"
         "来源媒体名括注在句尾即可。同一事件多篇报道合并成一条，信息取并集。\n"
         "3. 开头一句总览；某游戏无论述就整节省略，不写「暂无消息」。\n"
-        "4. 「未实装新角色」块：每名角色写 2 句中文介绍——翻译背景故事梗概、"
-        "点明星级/命途/属性/预期定位，标注未实装。命途字段是内部英文名，对照："
-        "Knight=存护、Warrior=毁灭、Rogue=巡猎、Mage=智识、Shaman=丰饶、"
-        "Priest=虚无、Memory=记忆、Elation=欢愉，其余按官方命途译名。\n"
+        "4. 「未实装新角色」块：每名角色 3~4 行——**第一行给定位判断**"
+        "（主C/副C/辅助/治疗/召唤体系等，依据下面技能组推断并附一句理由），"
+        "随后 2~3 句讲**核心机制**（终结技/天赋做什么、专属资源或忆灵怎么联动、"
+        "关键星魂亮点），技能改动方向（新体系 or 既有体系补强）要明确；"
+        "背景故事最多半句带过或省略。信息一律以下面技能描述为准，"
+        "**数值不确定就用定性描述，不要编造具体数字**，标注（未实装，以官方为准）。\n"
         "5. 措辞规范：未实装内容只写「传闻/未实装」，不要使用敏感措辞。\n"
         "6. 用 markdown 列表，全文严格 ≤1100 字——硬要求，超长会被系统整条删掉。\n\n"
         f"资讯列表：\n{raw}"
