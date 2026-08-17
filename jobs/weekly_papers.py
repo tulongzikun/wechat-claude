@@ -216,7 +216,7 @@ def main() -> None:
         if DRY_RUN:
             print(msg)
             return
-        push(msg)
+        push(msg, hook_env="WECOM_WEBHOOK_PAPERS")
         return
 
     top_n = min(10, len(hits))
@@ -231,7 +231,7 @@ def main() -> None:
         return
 
     log("总结完成，开始推送…")
-    n = push(full)
+    n = push(full, hook_env="WECOM_WEBHOOK_PAPERS")
     log(f"=== 完成，推送 {n} 人 ===")
 
 
