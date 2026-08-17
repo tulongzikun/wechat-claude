@@ -15,6 +15,7 @@
 
 import datetime
 import email.utils
+import json
 import os
 import re
 import sys
@@ -81,6 +82,48 @@ JUNK_RE = re.compile(
     r"会员开|打赏|返利|优惠|福利", re.I)
 
 DRY_RUN = "--dry-run" in sys.argv
+
+# ---------- hsr.nanoka.cc 星铁未实装新角色（静态 JSON 数据库） ----------
+# 站点是 SvelteKit SPA，真实数据在 static.nanoka.cc：版本号从首页 HTML 里
+# 正则提取（随官方版本更新），失败回落内置版本。release=0/未定 = 未实装。
+NANOKA_HOME = "https://hsr.nanoka.cc/"
+NANOKA_VER_FALLBACK = "4.4.54"
+
+
+def http_get(url: str, timeout: int = FETCH_TIMEOUT) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 games-digest/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def fetch_nanoka_upcoming() -> list[str]:
+    """星铁未实装新角色列表（名字/星级/命途/属性/背景梗概）。失败返回 []。"""
+    ver = NANOKA_VER_FALLBACK
+    try:
+        m = re.search(rb"static\.nanoka\.cc/hsr/([\d.]+)/character\.json", http_get(NANOKA_HOME))
+        if m:
+            ver = m.group(1).decode()
+    except Exception as e:
+        log(f"  ⚠️ nanoka 首页抓取失败: {e}")
+    try:
+        data = json.loads(http_get(f"https://static.nanoka.cc/hsr/{ver}/character.json"))
+    except Exception as e:
+        log(f"  ⚠️ nanoka character.json（{ver}）抓取失败: {e}")
+        return []
+    now = time.time()
+    lines = []
+    for cid, c in sorted(data.items()):
+        rel = c.get("release", 0)
+        if rel and rel <= now:   # 已实装跳过；未定档（rel=0）保留
+            continue
+        star = re.search(r"(\d)$", c.get("rank", ""))
+        lines.append(
+            f"- {c.get('zh', '?')}（{c.get('en', '?')}）"
+            f"{star.group(1) if star else '?'}星 命途:{c.get('baseType', '?')} "
+            f"属性:{c.get('damageType', '?')} 上线未定档。"
+            f"背景：{(c.get('desc') or '').replace(chr(10), ' ')[:200]}")
+    log(f"  nanoka：未实装新角色 {len(lines)} 名")
+    return lines
 
 
 # ---------- 时间窗口（与 weekly_papers 同语义：上个自然周 周一~周日）----------
@@ -170,8 +213,9 @@ def collect(start, end) -> dict[str, list[dict]]:
 
 # ---------- 总结 ----------
 
-def summarize(news: dict[str, list[dict]], start, end) -> str | None:
-    if not any(news.values()):
+def summarize(news: dict[str, list[dict]], start, end,
+              hsr_upcoming: list[str] | None = None) -> str | None:
+    if not any(news.values()) and not hsr_upcoming:
         return None
     raw_parts = []
     for game, items in news.items():
@@ -179,22 +223,30 @@ def summarize(news: dict[str, list[dict]], start, end) -> str | None:
             continue
         lines = [f"## {game}"]
         for it in items:
-            lines.append(f"- [{'+'.join(it['topics'])}] {it['title']}"
-                         f"（{it['source']}）{it['link']}")
+            lines.append(f"- [{'+'.join(it['topics'])}] {it['title']}（{it['source']}）")
         raw_parts.append("\n".join(lines))
+    if hsr_upcoming:
+        raw_parts.append(
+            "## 星穹铁道·未实装新角色（数据库 hsr.nanoka.cc，数据较可靠但未实装）\n"
+            + "\n".join(hsr_upcoming))
     raw = "\n\n".join(raw_parts)
     win = f"{start:%m-%d}~{end - datetime.timedelta(days=1):%m-%d}"
     prompt = (
         f"下面是上周（{win}）Google News 收录的米哈游游戏中文资讯"
-        f"（原神/崩坏：星穹铁道/绝区零/因缘精灵），每条带预标注主题、来源、链接。\n"
+        f"（原神/崩坏：星穹铁道/绝区零/因缘精灵），每条带预标注主题、来源媒体名。\n"
         "请生成给微信看的【米哈游每周游戏资讯】，要求：\n"
         "1. 按游戏分节；每节内按 更新 / 未实装情报（传闻，注明以官方为准）/ 联动 归类，"
         "无关条目（股价、招聘、纯广告）舍弃。\n"
-        "2. 每条格式：一句中文概括（≤30 字，保留关键版本号/角色/日期）+ 链接。"
-        "同一事件多篇报道只留一条，优先官方/大媒体来源。\n"
+        "2. 每条：**一句话标题式概括**（加粗）+ 1~2 句详细说明（版本号/日期/角色名/"
+        "机制数值/联动对象/上线时间等关键信息尽量写全）。**不要输出任何链接或 URL**，"
+        "来源媒体名括注在句尾即可。同一事件多篇报道合并成一条，信息取并集。\n"
         "3. 开头一句总览；某游戏无论述就整节省略，不写「暂无消息」。\n"
-        "4. 措辞规范：未实装内容只写「传闻/未实装」，不要使用敏感措辞。\n"
-        "5. 用 markdown 列表，全文（含链接）严格 ≤900 字——硬要求，超长会被系统整条删掉。\n\n"
+        "4. 「未实装新角色」块：每名角色写 2 句中文介绍——翻译背景故事梗概、"
+        "点明星级/命途/属性/预期定位，标注未实装。命途字段是内部英文名，对照："
+        "Knight=存护、Warrior=毁灭、Rogue=巡猎、Mage=智识、Shaman=丰饶、"
+        "Priest=虚无、Memory=记忆、Elation=欢愉，其余按官方命途译名。\n"
+        "5. 措辞规范：未实装内容只写「传闻/未实装」，不要使用敏感措辞。\n"
+        "6. 用 markdown 列表，全文严格 ≤1100 字——硬要求，超长会被系统整条删掉。\n\n"
         f"资讯列表：\n{raw}"
     )
     from anthropic import Anthropic  # 延迟 import
@@ -215,8 +267,8 @@ def summarize(news: dict[str, list[dict]], start, end) -> str | None:
             r = client.messages.create(
                 model=MODEL, max_tokens=1500,
                 messages=[{"role": "user", "content":
-                           "下面这份游戏资讯太长了，必须压缩到 900 字以内（含链接）。"
-                           "保持游戏分节与 更新/未实装情报/联动 分类，每条概括压到 ≤25 字，删掉修饰词。\n\n" + text}],
+                           "下面这份游戏资讯太长了，必须压缩到 1100 字以内（不含链接，别加链接）。"
+                           "保持游戏分节与 更新/未实装情报/联动 分类，删掉次要条目、保留每条最关键信息。\n\n" + text}],
             )
             t2 = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
             if t2:
@@ -226,16 +278,18 @@ def summarize(news: dict[str, list[dict]], start, end) -> str | None:
     return text or None
 
 
-def plain_digest(news: dict[str, list[dict]]) -> str:
-    """模型不可用/被网关过滤时的兜底：不经模型，直接拼脱敏后的条目。"""
+def plain_digest(news: dict[str, list[dict]], hsr_upcoming: list[str] | None = None) -> str:
+    """模型不可用/被网关过滤时的兜底：不经模型，直接拼脱敏后的条目（无链接）。"""
     parts = []
     for game, items in news.items():
         if not items:
             continue
         lines = [f"### {game}"]
         for it in items[:10]:
-            lines.append(f"- [{'+'.join(it['topics'])}] {it['title']} {it['link']}")
+            lines.append(f"- [{'+'.join(it['topics'])}] {it['title']}（{it['source']}）")
         parts.append("\n".join(lines))
+    if hsr_upcoming:
+        parts.append("### 星穹铁道·未实装新角色\n" + "\n".join(hsr_upcoming))
     return "\n\n".join(parts)
 
 
@@ -249,7 +303,8 @@ def main() -> None:
 
     news = collect(start, end)
     total = sum(len(v) for v in news.values())
-    summary = summarize(news, start, end)
+    hsr_up = fetch_nanoka_upcoming()
+    summary = summarize(news, start, end, hsr_upcoming=hsr_up)
 
     win = f"{start:%m-%d}~{end - datetime.timedelta(days=1):%m-%d}"
     if summary is None:
