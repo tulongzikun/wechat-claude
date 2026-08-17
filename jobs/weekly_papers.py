@@ -23,7 +23,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 
-from daily_update import push, MODEL   # 复用推送 + 模型名（haiku 走网关）
+from daily_update import push, MODEL, fit_bytes   # 复用推送 + 模型名 + 字节预算裁剪
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 NS = {
@@ -33,7 +33,8 @@ NS = {
 FETCH_TIMEOUT = 40
 MAX_RESULTS = 200        # 单次拉取（q-fin 每周 ~50，200 够覆盖数周）
 MAX_HITS = 40            # 喂给模型的论文上限（防 prompt 超长）
-MAX_REPLY_LEN = 1800     # 微信长文截断
+SUMMARY_BYTES = 3000     # 总结正文字节预算（企微 4096B 减去标题/链接余量）；
+                         # 超了让模型压缩一次，再超由 fit_bytes 整行删减兜底
 
 # 六主题关键词（匹配 标题 + 摘要）
 TOPIC_KW = {
@@ -165,8 +166,9 @@ def summarize(hits, start, end) -> str | None:
         "2. 开头一句总体概述：这周量化金融主要在推进哪些方向。\n"
         "3. 按主题分节：期货 / 股票 / 趋势交易 / 多因子 / 择时 / 量化模型；"
         "每篇归入最相关的一个主题，标注 [排名]，未入选的不再提及。\n"
-        "4. 每篇格式：「一句中文点评（做了什么、结论/价值、为什么重要）」后跟 arXiv 链接。\n"
-        "5. 用 markdown 列表，控制在 1200 字内，适合手机阅读、绝不能被截断。\n\n"
+        "4. 每篇格式：「一句中文点评（≤35 字：做了什么、结论/价值）」后跟 arXiv 链接。\n"
+        "5. 用 markdown 列表，全文（含链接）严格控制在 900 字内——这是硬要求，"
+        "超长会被系统整条删掉。\n\n"
         f"论文列表：\n{raw}"
     )
     from anthropic import Anthropic  # 延迟 import
@@ -176,6 +178,19 @@ def summarize(hits, start, end) -> str | None:
         messages=[{"role": "user", "content": prompt}],
     )
     text = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
+    # LLM 对字数不自控、逐次波动：超字节预算就明确要求压缩，重生成一次
+    if text and len(text.encode("utf-8")) > SUMMARY_BYTES:
+        log(f"  总结 {len(text.encode('utf-8'))} 字节超预算，压缩重生成…")
+        r = client.messages.create(
+            model=MODEL, max_tokens=1500,
+            messages=[{"role": "user", "content":
+                       "下面这份论文速递太长了，必须压缩到 900 字以内（含链接）。"
+                       "保持 Top10 和主题分节，每篇点评压到一句话 ≤30 字，删掉一切修饰词。\n\n"
+                       + text}],
+        )
+        t2 = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
+        if t2:
+            text = t2
     return text or None
 
 
@@ -208,8 +223,7 @@ def main() -> None:
               f"arXiv q-fin 命中 {len(hits)}/{total} 篇，精选 {top_n} 篇"
               f"（{', '.join(TOPIC_ORDER)}）")
     full = header + "\n\n" + summary
-    if len(full) > MAX_REPLY_LEN:
-        full = full[:MAX_REPLY_LEN] + "\n…(已截断)"
+    full = fit_bytes(full)   # 字节预算硬约束（企微 4096B），整行删减不半句截断
 
     if DRY_RUN:
         print("\n" + full + "\n")
