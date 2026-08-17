@@ -33,7 +33,9 @@ wechat/
 │   └── start.sh / stop.sh   # 后台常驻启停
 ├── jobs/              # 定时任务层（cron 调用，主动推送）
 │   ├── daily_update.py / .sh   # 每天 17:00：workspace 各仓 mainline 提交摘要
-│   └── weekly_papers.py / .sh  # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
+│   ├── weekly_papers.py / .sh  # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
+│   ├── games_news.py / .sh     # 每周二 10:00：米哈游游戏资讯（更新/未实装情报/联动）
+│   └── list_tasks.sh           # 配置体检：有哪些任务、各推哪个群
 ├── .env.example       # 本地配置模板（复制为 .env，bot 和 jobs 共用）
 ├── requirements.txt
 └── README.md
