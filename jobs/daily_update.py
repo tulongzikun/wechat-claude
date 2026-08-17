@@ -118,6 +118,16 @@ def default_branch(repo: Path) -> str | None:
     return None
 
 
+def repo_filter() -> str:
+    """仓库过滤子串：origin remote URL 里必须包含（如内网 git 域名）。空 = 不过滤。
+
+    配置在 .env 的 DAILY_REPO_FILTER，按需启用——比如只想汇总内网仓库
+    （git 内网域名）时设为该域名，个人/开源仓自动排除。域名本身视为敏感信息，
+    只放 .env（gitignore），代码里用占位示例。
+    """
+    return os.environ.get("DAILY_REPO_FILTER", "").strip()
+
+
 def collect_updates(since: str) -> list[dict]:
     """遍历所有仓库，返回窗口内有提交的仓库列表。
 
@@ -125,9 +135,17 @@ def collect_updates(since: str) -> list[dict]:
     每次跑都报同一个日历窗口，不受 fetch 时机或之前是否已 fetch 影响。
     """
     repos = sorted(p for p in WORKSPACE.iterdir() if (p / ".git").is_dir())
+    flt = repo_filter()
+    if flt:
+        log(f"仓库过滤：origin 含「{flt}」")
     updates = []
     for repo in repos:
         name = repo.name
+        if flt:
+            _, url = git(repo, "remote", "get-url", "origin")
+            if flt not in url:
+                log(f"  ⊘ {name}: origin 非目标域，跳过")
+                continue
         rc, _ = git(repo, "fetch", "--quiet", "origin")
         if rc != 0:
             log(f"  ⚠️ {name}: fetch 失败，沿用本地 origin 引用")

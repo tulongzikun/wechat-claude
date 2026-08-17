@@ -29,6 +29,14 @@ for v in $(grep -ho 'WECOM_WEBHOOK_[A-Z_]*' "$DIR"/*.py | sort -u); do
 done
 echo
 
+echo "══ 每日仓库摘要过滤（daily_update）══"
+if [ -n "${DAILY_REPO_FILTER:-}" ]; then
+    echo "  DAILY_REPO_FILTER = $DAILY_REPO_FILTER（origin 含此子串的仓库才汇总）"
+else
+    echo "  DAILY_REPO_FILTER 未设 = ~/workspace 全部仓库"
+fi
+echo
+
 echo "══ 个人微信收件人（ilink，24h 内有互动才可达）══"
 admins="${WECHAT_ADMIN_USERS:-}"
 if [ -n "$admins" ]; then
