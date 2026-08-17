@@ -55,6 +55,10 @@ bot 与 jobs 的关系：bot 负责微信通讯（被动回复 + 把每个用户
 
 - 只想要企微：留空 `WECHAT_ADMIN_USERS` 之外无需其他操作（ilink 找不到 token 自动跳过）。
 - 只想要微信：留空 `WECOM_WEBHOOK` 即回退纯 ilink。
+- **每个定时任务可推不同的群**：任务专用变量优先、`WECOM_WEBHOOK` 兜底——
+  `WECOM_WEBHOOK_DAILY`（每天 17:00 仓库摘要）、`WECOM_WEBHOOK_PAPERS`（每周一
+  10:00 论文速递）。专用变量留空自动回落通用值；新增任务时在 `.env` 加一个
+  `WECOM_WEBHOOK_<任务名>` 并在调用 `push(text, hook_env=...)` 时传入即可。
 - webhook 地址和 user_id 都是敏感信息，只放 `.env`（gitignore，不入库）。
 
 ## 安装

@@ -226,14 +226,15 @@ def recipients() -> list[tuple[str, str]]:
     return out
 
 
-def push_wecom(text: str) -> int:
+def push_wecom(text: str, hook_env: str = "WECOM_WEBHOOK") -> int:
     """企业微信群机器人 webhook 推送（markdown）。成功返回 1，未配置/失败返回 0。
 
     主动推送、无 context_token 依赖——ilink 的 24h token 过期问题在这里不存在。
-    webhook 从 .env 的 WECOM_WEBHOOK 读。markdown content 上限 4096 字节，
-    超长按字节安全截断（decode ignore 避免半个 UTF-8 字符）。
+    webhook 解析顺序：`hook_env` 指定的任务专用变量（如 WECOM_WEBHOOK_PAPERS）
+    → 通用 WECOM_WEBHOOK 兜底——每个定时任务可推到不同群。
+    markdown content 上限 4096 字节，超长按字节安全截断（decode ignore）。
     """
-    hook = os.environ.get("WECOM_WEBHOOK", "")
+    hook = os.environ.get(hook_env, "") or os.environ.get("WECOM_WEBHOOK", "")
     if not hook:
         return 0
     import requests  # 延迟 import
@@ -280,15 +281,17 @@ def push_ilink(text: str) -> int:
     return sent
 
 
-def push(text: str) -> int:
+def push(text: str, hook_env: str = "WECOM_WEBHOOK") -> int:
     """双通道同步推送：企微群 webhook + ilink 个人微信，各推一份、互不影响。
 
+    hook_env 指定本任务专用的企微 webhook 变量名（缺省通用 WECOM_WEBHOOK），
+    解析顺序：专用 → 通用兜底——同一台机器上不同定时任务可各推各的群。
     企微是主动通道（无条件成功）；ilink 需 24h 内有互动，过期只降级不阻断。
     返回成功通道数（0=两个都没送达）。
     """
     sent = 0
     # 1) 企业微信群机器人 webhook——主动推送，不依赖用户互动 / context_token
-    if push_wecom(text):
+    if push_wecom(text, hook_env=hook_env):
         sent += 1
     # 2) ilink——个人微信同步一份；token 过期只是少了这份，不影响企微结果
     if push_ilink(text):
@@ -311,7 +314,7 @@ def main() -> None:
         if DRY_RUN:
             print(msg)
             return
-        push(msg)
+        push(msg, hook_env="WECOM_WEBHOOK_DAILY")
         return
 
     total = sum(u["count"] for u in updates)
@@ -325,7 +328,7 @@ def main() -> None:
         return
 
     log("总结完成，开始推送…")
-    n = push(full)
+    n = push(full, hook_env="WECOM_WEBHOOK_DAILY")
     log(f"=== 完成，推送 {n} 人 ===")
 
 
