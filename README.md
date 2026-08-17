@@ -104,6 +104,7 @@ bash bot/start.sh      # 后台常驻（setsid + nohup，脱离终端）
 tail -f bot/bot.log    # 看日志
 bash bot/stop.sh       # 停止
 
+bash jobs/list_tasks.sh    # 配置体检：有哪些任务、推到哪些群/哪些微信
 bash jobs/daily_update.sh  --dry-run   # 定时任务试跑（只打印不推送）
 bash jobs/weekly_papers.sh --dry-run
 ```
