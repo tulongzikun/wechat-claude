@@ -22,6 +22,7 @@
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -226,33 +227,51 @@ def recipients() -> list[tuple[str, str]]:
     return out
 
 
+def wecom_hooks(hook_env: str = "WECOM_WEBHOOK") -> list[str]:
+    """按任务解析企微 webhook 列表（可推多个群）。
+
+    取值：`hook_env` 指定的任务专用变量（如 WECOM_WEBHOOK_PAPERS），为空回落
+    通用 WECOM_WEBHOOK。单个变量里可写多个地址（逗号/空白/换行分隔）——
+    一份内容同时推到多个群。去重保序。
+    """
+    raw = os.environ.get(hook_env, "") or os.environ.get("WECOM_WEBHOOK", "")
+    seen, hooks = set(), []
+    for h in re.split(r"[,\s]+", raw.strip()):
+        if h and h not in seen:
+            seen.add(h)
+            hooks.append(h)
+    return hooks
+
+
 def push_wecom(text: str, hook_env: str = "WECOM_WEBHOOK") -> int:
-    """企业微信群机器人 webhook 推送（markdown）。成功返回 1，未配置/失败返回 0。
+    """企业微信群机器人 webhook 推送（markdown），支持多群。返回成功群数。
 
     主动推送、无 context_token 依赖——ilink 的 24h token 过期问题在这里不存在。
-    webhook 解析顺序：`hook_env` 指定的任务专用变量（如 WECOM_WEBHOOK_PAPERS）
-    → 通用 WECOM_WEBHOOK 兜底——每个定时任务可推到不同群。
+    webhook 列表来自 wecom_hooks()：任务专用变量 → 通用兜底，可逗号分隔多个。
     markdown content 上限 4096 字节，超长按字节安全截断（decode ignore）。
     """
-    hook = os.environ.get(hook_env, "") or os.environ.get("WECOM_WEBHOOK", "")
-    if not hook:
+    hooks = wecom_hooks(hook_env)
+    if not hooks:
         return 0
     import requests  # 延迟 import
     b = text.encode("utf-8")
     content = text if len(b) <= 4000 else b[:4000].decode("utf-8", "ignore") + "\n…(已截断)"
-    try:
-        r = requests.post(hook, json={"msgtype": "markdown",
-                                      "markdown": {"content": content}}, timeout=15)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("errcode") != 0:
-            log(f"  ⚠️ 企微推送失败: {d}")
-            return 0
-        log("  📨 已推送 -> 企微群机器人")
-        return 1
-    except Exception as e:
-        log(f"  ⚠️ 企微推送失败: {e}")
-        return 0
+    sent = 0
+    for i, hook in enumerate(hooks, 1):
+        tag = f"{i}/{len(hooks)}" if len(hooks) > 1 else ""
+        try:
+            r = requests.post(hook, json={"msgtype": "markdown",
+                                          "markdown": {"content": content}}, timeout=15)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("errcode") != 0:
+                log(f"  ⚠️ 企微推送失败{tag}: {d}")
+                continue
+            log(f"  📨 已推送 -> 企微群机器人{tag}")
+            sent += 1
+        except Exception as e:
+            log(f"  ⚠️ 企微推送失败{tag}: {e}")
+    return sent
 
 
 def push_ilink(text: str) -> int:
@@ -285,9 +304,9 @@ def push(text: str, hook_env: str = "WECOM_WEBHOOK") -> int:
     """双通道同步推送：企微群 webhook + ilink 个人微信，各推一份、互不影响。
 
     hook_env 指定本任务专用的企微 webhook 变量名（缺省通用 WECOM_WEBHOOK），
-    解析顺序：专用 → 通用兜底——同一台机器上不同定时任务可各推各的群。
+    解析顺序：专用 → 通用兜底；变量里可写多个地址（逗号/空白分隔）推多个群。
     企微是主动通道（无条件成功）；ilink 需 24h 内有互动，过期只降级不阻断。
-    返回成功通道数（0=两个都没送达）。
+    返回成功送达的通道数（企微按群计 + ilink 按人计；0=全没送达）。
     """
     sent = 0
     # 1) 企业微信群机器人 webhook——主动推送，不依赖用户互动 / context_token

@@ -59,6 +59,8 @@ bot 与 jobs 的关系：bot 负责微信通讯（被动回复 + 把每个用户
   `WECOM_WEBHOOK_DAILY`（每天 17:00 仓库摘要）、`WECOM_WEBHOOK_PAPERS`（每周一
   10:00 论文速递）。专用变量留空自动回落通用值；新增任务时在 `.env` 加一个
   `WECOM_WEBHOOK_<任务名>` 并在调用 `push(text, hook_env=...)` 时传入即可。
+- **推多个群**：任一 webhook 变量都可写多个地址（逗号/空白分隔），一份内容
+  同时发到所有群（去重保序，20 条/分钟限频内基本够用）。
 - webhook 地址和 user_id 都是敏感信息，只放 `.env`（gitignore，不入库）。
 
 ## 安装
