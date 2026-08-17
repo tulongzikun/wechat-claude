@@ -38,7 +38,10 @@ sys.path.insert(0, str(BOT_DIR))
 
 FETCH_TIMEOUT = 60            # 单仓库 fetch 超时
 MAX_COMMITS_PER_REPO = 30     # 每仓库喂给模型的提交上限（防超长）
-MAX_REPLY_LEN = 1800          # 微信长文体验差，超出截断
+MAX_REPLY_LEN = 1800          # 字符上限（体验约束，次级）
+MAX_REPLY_BYTES = 3600        # 字节上限（硬约束）：企微 markdown 限 4096 字节，
+                              # 中文 1 字=3 字节，1800 字≈5400 字节会超——所以
+                              # 真正的限制是字节不是字符，超了整行删减绝不半句截断
 
 # 模型：优先用网关配的 haiku 别名，回退到默认模型名
 MODEL = (
@@ -152,6 +155,23 @@ def collect_updates(since: str) -> list[dict]:
 
 
 # ---------- 总结 ----------
+
+def fit_bytes(text: str, budget: int = MAX_REPLY_BYTES) -> str:
+    """按 UTF-8 字节预算裁剪：超了从末尾【整行】删，绝不半句截断。
+
+    企微 markdown 上限 4096 字节（中文 1 字=3 字节），字符数限制管不住字节；
+    半句截断会把链接/排名切成废字，所以宁可整条少一篇，末尾标注省略行数。
+    """
+    b = text.encode("utf-8")
+    if len(b) <= budget:
+        return text
+    lines = text.rstrip().split("\n")
+    dropped = 0
+    while len(lines) > 4 and len(("\n".join(lines)).encode("utf-8")) + 64 > budget:
+        lines.pop()
+        dropped += 1
+    return "\n".join(lines) + f"\n…（超长，整行省略 {dropped} 条）"
+
 
 def summarize(updates: list[dict], since: str) -> str | None:
     """把窗口内提交喂给 Claude，生成适合微信阅读的中文摘要。无内容返回 None。"""
@@ -298,8 +318,7 @@ def main() -> None:
     header = (f"📢 项目每日更新（{time.strftime('%m-%d')}）\n"
               f"自昨日17:00起，{len(updates)} 个仓库共 {total} 条新提交")
     full = header + "\n\n" + summary
-    if len(full) > MAX_REPLY_LEN:
-        full = full[:MAX_REPLY_LEN] + "\n…(已截断)"
+    full = fit_bytes(full)   # 字节预算硬约束（企微 4096B），整行删减不半句截断
 
     if DRY_RUN:
         print("\n" + full + "\n")
