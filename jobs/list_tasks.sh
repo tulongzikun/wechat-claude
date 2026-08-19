@@ -28,6 +28,12 @@ while IFS='|' read -r name cron hook desc; do
     else
         inst="❌ 未挂 crontab（不会定时触发！）"
     fi
+    # 实现文件存在性：注册名 ↔ jobs/<注册名>.py（run.sh 按此约定调起）
+    if [ -f "$DIR/$name.py" ]; then
+        impl="✅ $name.py"
+    else
+        impl="❌ $name.py 不存在（run.sh 会拒绝执行）"
+    fi
     # 专属群配置状态
     val="${!hook:-}"
     if [ -n "$val" ]; then
@@ -35,8 +41,17 @@ while IFS='|' read -r name cron hook desc; do
     else
         wh="🌐 ${hook} 未配 → 回落 WECOM_WEBHOOK"
     fi
+    # 代码关联：py 里 push() 的 hook_env 参数须与注册的 webhook 变量一致
+    # （用通用 WECOM_WEBHOOK 的任务无 hook_env，跳过）
+    if [ "$hook" != "WECOM_WEBHOOK" ] && [ -f "$DIR/$name.py" ]; then
+        if grep -q "hook_env=\"$hook\"" "$DIR/$name.py"; then
+            wh="$wh；✅ 代码已关联"
+        else
+            wh="$wh；❌ 代码未引用 $hook（push 的 hook_env 参数要与注册一致）"
+        fi
+    fi
     echo "• $name  [$cron]  $desc"
-    echo "    $inst；$wh"
+    echo "    $inst；$impl；$wh"
 done < "$CONF"
 
 # 反向核对：crontab 里有 run.sh 调用但没在注册表登记的任务
