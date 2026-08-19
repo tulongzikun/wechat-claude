@@ -37,6 +37,7 @@ wechat/
 │   ├── daily_update.py    # 每天 17:00：workspace 各仓 mainline 提交摘要
 │   ├── weekly_papers.py   # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
 │   ├── games_news.py      # 每周二 10:00：米哈游游戏资讯（更新/未实装情报/联动）
+│   ├── macro_weekly.py    # 每周四 10:00：宏观周报（数据发布/基本面/市场/行业景气/前瞻）
 │   └── list_tasks.sh      # 配置体检：以注册表核对 crontab / webhook / 收件人
 ├── .env.example       # 本地配置模板（复制为 .env，bot 和 jobs 共用）
 ├── requirements.txt

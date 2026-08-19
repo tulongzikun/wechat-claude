@@ -21,3 +21,4 @@ update_state.json
 # Python
 __pycache__/
 *.pyc
+macro_state.json
