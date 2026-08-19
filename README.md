@@ -32,10 +32,12 @@ wechat/
 │   ├── login.py       #   扫码登录 + token 持久化
 │   └── start.sh / stop.sh   # 后台常驻启停
 ├── jobs/              # 定时任务层（cron 调用，主动推送）
-│   ├── daily_update.py / .sh   # 每天 17:00：workspace 各仓 mainline 提交摘要
-│   ├── weekly_papers.py / .sh  # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
-│   ├── games_news.py / .sh     # 每周二 10:00：米哈游游戏资讯（更新/未实装情报/联动）
-│   └── list_tasks.sh           # 配置体检：有哪些任务、各推哪个群
+│   ├── run.sh         #   统一入口：环境装载 + 时区，跑 jobs/<任务名>.py
+│   ├── tasks.conf     #   任务注册表：任务名 | cron | 专属 webhook 变量 | 说明
+│   ├── daily_update.py    # 每天 17:00：workspace 各仓 mainline 提交摘要
+│   ├── weekly_papers.py   # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
+│   ├── games_news.py      # 每周二 10:00：米哈游游戏资讯（更新/未实装情报/联动）
+│   └── list_tasks.sh      # 配置体检：以注册表核对 crontab / webhook / 收件人
 ├── .env.example       # 本地配置模板（复制为 .env，bot 和 jobs 共用）
 ├── requirements.txt
 └── README.md
@@ -65,6 +67,30 @@ bot 与 jobs 的关系：bot 负责微信通讯（被动回复 + 把每个用户
   同时发到所有群（去重保序，20 条/分钟限频内基本够用）。
 - webhook 地址和 user_id 都是敏感信息，只放 `.env`（gitignore，不入库）。
 
+## 新增推送任务（注册规范）
+
+任务三件套：**`jobs/<任务名>.py`（实现）→ `jobs/tasks.conf`（登记）→ crontab（挂载）**，
+都通过唯一的 `run.sh` 入口调起（环境装载/时区不用每个任务抄一份 wrapper）。
+
+1. **写实现** `jobs/<任务名>.py`，复用 `daily_update` 的基建：
+   ```python
+   from daily_update import push, fit_bytes, log   # 双通道推送/字节预算/日志
+   ```
+   - 推送：`push(text, hook_env="WECOM_WEBHOOK_<大写任务名>")`——企微群 + 个人微信双通道；
+   - 长度：企微 markdown 上限 **4096 字节**（中文 1 字=3 字节），全文过 `fit_bytes()`；
+     LLM 产出超预算先压缩重生成一次，`fit_bytes` 兜底（整行删、绝不半句截断）；
+   - LLM 输入/输出过网关内容过滤（敏感措辞会 1301 拒绝），送模型前脱敏 + try/except 兜底；
+   - 支持 `--dry-run`（只抓+总结+打印，不推送）。
+2. **登记**：`jobs/tasks.conf` 加一行 `任务名 | cron 表达式 | 专属 webhook 变量 | 说明`。
+3. **挂载**：crontab 的 `CRON_TZ=Asia/Shanghai` 段内加一条
+   `<cron> /path/to/wechat/jobs/run.sh <任务名> >> /path/to/wechat/jobs/<任务名>.log 2>&1`，
+   装完 `ls -l jobs/run.sh` 确认可执行位（cron 直调脚本必须 +x）。
+4. **分群（可选）**：要专属群就在 `.env` 加 `WECOM_WEBHOOK_<变量>`（可逗号分隔多个群），
+   不加则回落通用 `WECOM_WEBHOOK`。
+
+验证：`bash jobs/run.sh <任务名> --dry-run` 看输出，`bash jobs/list_tasks.sh` 体检
+（会自动核对注册表 ↔ crontab ↔ webhook 三者一致性，漏挂/漏登记都会标出来）。
+
 ## 安装
 
 ```bash
@@ -72,12 +98,13 @@ cd wechat
 pip install -r requirements.txt      # 含 claude-agent-sdk（捆绑原生 claude 二进制）
 ```
 
-定时任务挂 crontab（见 `jobs/*.sh` 头部注释；`CRON_TZ=Asia/Shanghai`）：
+定时任务挂 crontab（统一用 `run.sh <任务名>` 调起；`CRON_TZ=Asia/Shanghai`）：
 
 ```
 CRON_TZ=Asia/Shanghai
-0 17 * * * /path/to/wechat/jobs/daily_update.sh  >> /path/to/wechat/jobs/daily_update.log 2>&1
-0 10 * * 1 /path/to/wechat/jobs/weekly_papers.sh >> /path/to/wechat/jobs/weekly_papers.log 2>&1
+0 17 * * * /path/to/wechat/jobs/run.sh daily_update   >> /path/to/wechat/jobs/daily_update.log 2>&1
+0 10 * * 1 /path/to/wechat/jobs/run.sh weekly_papers  >> /path/to/wechat/jobs/weekly_papers.log 2>&1
+0 10 * * 2 /path/to/wechat/jobs/run.sh games_news     >> /path/to/wechat/jobs/games_news.log 2>&1
 ```
 
 ## 配置
@@ -106,9 +133,9 @@ bash bot/start.sh      # 后台常驻（setsid + nohup，脱离终端）
 tail -f bot/bot.log    # 看日志
 bash bot/stop.sh       # 停止
 
-bash jobs/list_tasks.sh    # 配置体检：有哪些任务、推到哪些群/哪些微信
-bash jobs/daily_update.sh  --dry-run   # 定时任务试跑（只打印不推送）
-bash jobs/weekly_papers.sh --dry-run
+bash jobs/list_tasks.sh                  # 配置体检：注册表 ↔ crontab ↔ webhook 一致性
+bash jobs/run.sh daily_update --dry-run  # 定时任务试跑（只打印不推送，任务名见 tasks.conf）
+bash jobs/run.sh weekly_papers --dry-run
 ```
 
 首次运行会生成二维码（`qr.png`），**在手机微信里**扫码登录（二维码页依赖

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """每周一抓 arXiv q-fin 上周新论文 → 关键词粗筛 → Claude 按主题总结 → 推送微信。
 
-由 cron 每周一 10:00 触发（见 weekly_papers.sh + crontab，CRON_TZ=Asia/Shanghai）。
+由 cron 每周一 10:00 触发（run.sh weekly_papers + crontab，CRON_TZ=Asia/Shanghai）。
 
 设计要点：
 - 数据源 arXiv q-fin（cat:q-fin*），走 https（本机 80 端口封、443 通）。

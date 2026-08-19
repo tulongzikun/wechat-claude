@@ -1,35 +1,61 @@
 #!/usr/bin/env bash
-# 定时任务配置体检：有哪些任务、什么时候跑、各推到哪个企微群/哪些微信。
-# 用法：bash jobs/list_tasks.sh   （无需 root，读 crontab + .env + bot 运行态）
+# 定时任务配置体检：以 jobs/tasks.conf 注册表为准，交叉核对 crontab 安装状态、
+# 各任务企微 webhook 配置、个人微信收件人可达性。
+# 用法：bash jobs/list_tasks.sh   （无需 root，读 tasks.conf + crontab + .env + bot 运行态）
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="$DIR/tasks.conf"
 
 # 载入 .env（只为了判断变量是否已配，不回显任何真实值）
 [ -f "$DIR/../.env" ] && { set -a; source "$DIR/../.env" 2>/dev/null; set +a; }
 
-echo "══ 定时任务（crontab，CRON_TZ=Asia/Shanghai）══"
-crontab -l 2>/dev/null | grep 'wechat/jobs/' | sed 's#/home/zhouzikun/workspace/wechat/jobs/##g' \
-  || echo "（crontab 里没有 wechat 任务！）"
-echo
-
-echo "══ 企微 webhook 配置（变量可逗号分隔多个群）══"
 count_groups() { echo "$1" | grep -o 'key=' | wc -l; }
-if [ -n "${WECOM_WEBHOOK:-}" ]; then
-    echo "  WECOM_WEBHOOK        已配（$(count_groups "$WECOM_WEBHOOK") 个群）← 通用兜底"
-else
-    echo "  WECOM_WEBHOOK        未配（企微通道整体关闭，只走个人微信）"
+
+if [ ! -f "$CONF" ]; then
+    echo "⚠️ 注册表 $CONF 不存在"
+    exit 1
 fi
-# 任务专属变量从代码里自动发现，新增任务无需改本脚本
-for v in $(grep -ho 'WECOM_WEBHOOK_[A-Z_]*' "$DIR"/*.py | sort -u); do
-    val="${!v:-}"
-    if [ -n "$val" ]; then
-        echo "  $v 已配（$(count_groups "$val") 个群）"
+
+echo "══ 已注册任务（tasks.conf）══"
+# 任务名 | cron | webhook 变量 | 说明
+while IFS='|' read -r name cron hook desc; do
+    name="$(echo "$name" | xargs)"; [ -z "$name" ] && continue
+    case "$name" in \#*) continue ;; esac
+    cron="$(echo "$cron" | xargs)"; hook="$(echo "$hook" | xargs)"
+    desc="$(echo "$desc" | xargs)"
+    # cron 安装状态：crontab 里是否有 run.sh <任务名>
+    if crontab -l 2>/dev/null | grep -q "run\.sh $name\>"; then
+        inst="✅ 已挂 crontab"
     else
-        echo "  $v 未配 → 回落 WECOM_WEBHOOK"
+        inst="❌ 未挂 crontab（不会定时触发！）"
     fi
+    # 专属群配置状态
+    val="${!hook:-}"
+    if [ -n "$val" ]; then
+        wh="🌐 ${hook}（$(count_groups "$val") 个群）"
+    else
+        wh="🌐 ${hook} 未配 → 回落 WECOM_WEBHOOK"
+    fi
+    echo "• $name  [$cron]  $desc"
+    echo "    $inst；$wh"
+done < "$CONF"
+
+# 反向核对：crontab 里有 run.sh 调用但没在注册表登记的任务
+registered="$(awk -F'|' '!/^#/ && NF>=4 {gsub(/ /,"",$1); print $1}' "$CONF")"
+stray="$(crontab -l 2>/dev/null | grep -o 'run\.sh [a-z_0-9]*' | awk '{print $2}' | sort -u)"
+for s in $stray; do
+    echo "$registered" | grep -qx "$s" || echo "⚠️ crontab 调用 run.sh $s，但 tasks.conf 未登记"
 done
 echo
 
-echo "══ 每日仓库摘要过滤（daily_update）══"
+echo "══ 通用企微 webhook（变量可逗号分隔多个群）══"
+if [ -n "${WECOM_WEBHOOK:-}" ]; then
+    echo "  WECOM_WEBHOOK 已配（$(count_groups "$WECOM_WEBHOOK") 个群）← 未配专属变量的任务都推这里"
+else
+    echo "  WECOM_WEBHOOK 未配（企微通道整体关闭，只走个人微信）"
+fi
+echo
+
+echo "══ daily_update 仓库过滤 ══"
 if [ -n "${DAILY_REPO_FILTER:-}" ]; then
     echo "  DAILY_REPO_FILTER = $DAILY_REPO_FILTER（origin 含此子串的仓库才汇总）"
 else

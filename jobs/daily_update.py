@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """每日拉取 ~/workspace 下所有项目的 mainline 更新 → Claude 总结 → 主动推送微信。
 
-由 cron 每日 17:00 触发（见 daily_update.sh + crontab）。
+由 cron 每日 17:00 触发（run.sh daily_update + crontab）。
 
 设计要点：
 - 只 `git fetch`，**不 merge / 不 checkout**，绝不碰工作区。
@@ -70,7 +70,7 @@ def load_json(path: Path, default):
 
 # ---------- 时间窗口 ----------
 
-# 报告时区由 daily_update.sh 的 `export TZ="${CRON_TZ:-Asia/Shanghai}"` 设定，
+# 报告时区由 run.sh 的 `export TZ="${CRON_TZ:-Asia/Shanghai}"` 设定，
 # 复用 cron 注入的 CRON_TZ（cronie 已实测会传进 job 环境），与 cron 触发时区一致——
 # 单一来源、零硬编码：换时区只改 crontab 的 CRON_TZ，脚本无需改动。
 # 下午 5 点是「每日报告」的业务锚点。
