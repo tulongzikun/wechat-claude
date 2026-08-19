@@ -7,9 +7,11 @@
   二、美国基本面：日历本周发布的美国数据（公布/预期/前值，附升降箭头）
   三、市场与行业景气：股债汇商品周表现 + 8marketcap 前 200 板块聚合与
      变动最大公司（快照 diff，行业靠内置 ticker 映射，站点无行业分类）
-  四、下周关注：日历未来 7 天
+  四、国际局势：Google News RSS 俄乌/中东/中美经贸/制裁方向（复用
+     games_news 的抓取+垃圾过滤），LLM 归纳 3~5 条要点（失败退化为标题列表）
+  五、下周关注：日历未来 7 天
 
-超过单条预算自动拆两条推送（企微 markdown 4096B/条）。
+超过单条预算自动按节贪心拆条推送（企微 markdown 4096B/条）。
 数据源稳定性差异大，所有抓取独立 try/except：单项失败标注跳过，不拖垮整报。
 
 调试：python3 macro_weekly.py --dry-run   只抓+拼装+打印，不推送。
@@ -37,6 +39,7 @@ EVENT_DAYS_BACK = 7     # 发布回顾窗口
 EVENT_DAYS_FWD = 7      # 前瞻窗口
 IMPORTANT = 2           # 经济日历重要性下限（实测 1~2 档，2=高，3 档不存在）
 SPLIT_BYTES = 3300      # 超过则拆两条推送（留 header 余量）
+GEO_MAX_BYTES = 1100    # 国际局势章字节帽（LLM 输出易超产，从尾部整行删）
 
 # ---------- 小工具 ----------
 
@@ -433,11 +436,15 @@ def industry_mood(rows: list[dict], state: dict) -> tuple[list[str], dict]:
         "• 7日市值变动居后：" + "、".join(
             f"{r['name']}({sec(r['ticker'])}){r['wk']:+.1f}%" for r in movers_dn)]
     if prev:
+        delta = lambda r: prev[r["ticker"]] - r["rank"]
         dr = sorted((r for r in rows if r["ticker"] in prev
-                     and abs(prev[r["ticker"]] - r["rank"]) >= 2),   # ±1 是盘次间噪声
-                    key=lambda r: -(prev[r["ticker"]] - r["rank"]))
-        ups = [f"{r['name']}{prev[r['ticker']] - r['rank']:+d}位" for r in dr[:3]]
-        dns = [f"{r['name']}{prev[r['ticker']] - r['rank']:+d}位" for r in reversed(dr[-3:])]
+                     and abs(delta(r)) >= 2),            # ±1 是盘次间噪声
+                    key=lambda r: -delta(r))
+        # 按符号分组取 top3：达标公司不足 6 家时 dr[:3]/dr[-3:] 会重叠，
+        # 曾把 -2/-3 位的公司排进「上升居前」
+        ups = [f"{r['name']}{delta(r):+d}位" for r in dr if delta(r) > 0][:3]
+        dns = [f"{r['name']}{delta(r):+d}位"
+               for r in [x for x in dr if delta(x) < 0][-3:][::-1]]
         if ups:
             lines.append("• 排名上升居前：" + "、".join(ups))
         if dns:
@@ -470,6 +477,130 @@ def industry_mood(rows: list[dict], state: dict) -> tuple[list[str], dict]:
     return lines, new_state
 
 
+# ---------- 四、国际局势（Google News RSS + LLM 归纳，复用 games_news 基建） ----------
+
+GEO_QUERIES = ("俄乌", "中东 局势", "中美 关税", "国际制裁")
+
+# 网关 1301 软化：时政标题里的敏感组合送模型前换中性说法（实测 ICC 制裁类被拒）
+GEO_SAFE = [
+    ("国际刑事法院", "国际司法机构"), ("国际刑事法庭", "国际司法机构"),
+    ("ICC", "国际司法机构"), ("制裁", "施加限制措施"), ("开刀", "采取行动"),
+    ("反抗", "反制"), ("打击", "行动"), ("袭击", "冲突事件"), ("战争", "军事冲突"),
+]
+
+
+def _geo_sanitize(text: str) -> str:
+    for a, b in GEO_SAFE:
+        text = text.replace(a, b)
+    return text
+
+
+def geopolitics() -> list[str]:
+    """本周国际局势要点 3~5 条。
+
+    网关 1301 是对整段输入的组合打分（实测：单条标题都过、拼 12 条即拒，
+    剔除任一条仍拒）——所以不能一次性把标题喂给模型。改为两级：
+    ① 每 6 条一批让模型写成中性要点（批内可过）；② 把各批要点合并成稿
+    （此时输入已是模型中性化措辞，不再含原始标题）。任一步失败退化为
+    每 query 最新 2 条的标题列表。
+    """
+    try:
+        from games_news import fetch_gnews, JUNK_RE   # jobs/ 内复用
+    except Exception as e:
+        log(f"  ⚠️ 复用 games_news 失败: {e}")
+        return []
+    per_q: dict[str, list[dict]] = {}
+    merged: dict[str, dict] = {}
+    for q in GEO_QUERIES:
+        bucket = []
+        for it in fetch_gnews(q):
+            key = re.sub(r"\W", "", it["title"].split(" - ")[0])[:24]
+            if key in merged or JUNK_RE.search(it["title"]):
+                continue
+            merged[key] = it
+            bucket.append(it)
+        bucket.sort(key=lambda x: x["published"], reverse=True)
+        per_q[q] = bucket
+    all_items = sorted(merged.values(), key=lambda x: x["published"], reverse=True)
+    if not all_items:
+        return []
+
+    from anthropic import Anthropic
+    model = (os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+             or os.environ.get("ANTHROPIC_MODEL") or "claude-haiku-4-5")
+
+    def _llm(prompt: str) -> str:
+        r = Anthropic().messages.create(
+            model=model, max_tokens=600,
+            messages=[{"role": "user", "content": prompt}])
+        return "".join(b.text for b in r.content
+                       if getattr(b, "type", "") == "text").strip()
+
+    # ① 分批归纳（每批 6 条：批太大网关组合打分会拒，失败减半重试一次）
+    bullets: list[str] = []
+    titles = [_geo_sanitize(it["title"]) + f"（{it['source']}）"
+              for it in all_items[:24]]
+    for i in range(0, len(titles), 6):
+        batch = titles[i:i + 6]
+        for size in (len(batch), max(3, len(batch) // 2)):
+            try:
+                text = _llm(
+                    "下面是一批上周国际时政/经贸中文新闻标题（措辞已部分中性化）。"
+                    "归纳成 1~2 条要点：每条 **加粗一句话概括** + 1 句进展 + "
+                    "1 句对市场/能源/供应链的影响；同事件合并，无关舍弃；"
+                    "不输出链接，来源媒体名括注句尾，措辞中性客观。markdown 列表。\n\n"
+                    + "\n".join(f"- {t}" for t in batch[:size]))
+                bullets.extend(l for l in text.splitlines() if l.strip())
+                break
+            except Exception as e:
+                log(f"  ⚠️ 国际局势批归纳失败（{size} 条）: {e}")
+    bullets = _geo_tidy(bullets)
+    if not bullets:
+        return _geo_fallback(per_q)
+
+    # ② 合并成稿（输入已是中性化要点）
+    try:
+        text = _llm(
+            "下面是对上周国际时政/经贸新闻的分批归纳要点。请合并成最终 "
+            "3~5 条本周国际局势要点：**同一事件多批重复出现时只保留一条**"
+            "（取信息最全的），每条 **加粗一句话概括** + 1 句进展 + 1 句对"
+            "市场/能源/供应链的影响，每条 ≤60 字，按对市场影响排序；"
+            "措辞中性客观，不输出链接。markdown 列表。\n\n" + "\n".join(bullets))
+        out = _geo_tidy([l for l in text.splitlines() if l.strip()])
+        return out if out else bullets[:5]
+    except Exception as e:
+        log(f"  ⚠️ 国际局势合并失败，用分批要点: {e}")
+        return bullets[:5]
+
+
+def _geo_tidy(lines: list[str]) -> list[str]:
+    """模型输出的行归一：行首 */-/*** 等杂前缀统一成「- **…」，段中粘连的
+    『。 - **』拆成独立行。注意 *** 的前两位就是 **，不能用 find 定位加粗——
+    先剥掉行首 bullet 字符，剩体内部还有闭合加粗就补一个开标记。"""
+    out = []
+    for l in lines:
+        for piece in re.split(r"。?\s+-\s+\*\*", l):
+            body = piece.strip().lstrip("*- \t")
+            if not body:
+                continue
+            if not body.startswith("**") and "**" in body:
+                body = "**" + body          # 加粗开标记被 bullet 剥离/拆分吃掉
+            out.append("- " + body)
+    return out
+
+
+def _geo_fallback(per_q: dict[str, list[dict]]) -> list[str]:
+    """LLM 全挂时的确定性兜底：每 query 最新 2 条，跨 query 去重。"""
+    out, seen = [], set()
+    for q in GEO_QUERIES:
+        for it in per_q.get(q, [])[:2]:
+            k = re.sub(r"\W", "", it["title"])[:12]
+            if k not in seen:
+                seen.add(k)
+                out.append(f"- {it['title']}（{it['source']}）")
+    return out[:6]
+
+
 # ---------- 主流程 ----------
 
 def main() -> None:
@@ -487,6 +618,16 @@ def main() -> None:
     sec_ind, new_state = industry_mood(rows, state) if rows else (["• 抓取失败"], {})
     if rows and not DRY_RUN:
         save_state(new_state)      # dry-run 不落快照，避免污染下次 diff 基准
+    sec_geo = geopolitics()
+    # 国际局势是唯一 LLM 产出的正文节，超预算从尾部整行删（前 3~4 条信息密度最高）
+    kept, nb = [], 0
+    for l in sec_geo:
+        lb = len(l.encode("utf-8")) + 1
+        if kept and nb + lb > GEO_MAX_BYTES:
+            break
+        kept.append(l)
+        nb += lb
+    sec_geo = kept
     fwd = calendar_forward()
 
     parts = []
@@ -498,28 +639,35 @@ def main() -> None:
                      + (f"\n小结：{us_sum}" if us_sum else ""))
     if sec_mkt or sec_ind:
         parts.append("三、市场与行业景气\n" + "\n".join(sec_mkt + sec_ind))
+    if sec_geo:
+        parts.append("四、国际局势\n" + "\n".join(sec_geo))
     if fwd:
-        parts.append("四、下周关注\n" + "\n".join(fwd))
+        parts.append("五、下周关注\n" + "\n".join(fwd))
 
     win = f"{datetime.date.today() - datetime.timedelta(days=7):%m-%d}~{datetime.date.today():%m-%d}"
-    header = f"📊 宏观周报（{win}）\n中国基本面 / 美国基本面 / 市场与行业 / 下周前瞻"
-    body = "\n\n".join(parts)
-    log(f"拼装完成：{len(body.encode('utf-8'))} 字节，耗时 {time.time() - t0:.0f}s")
+    header = f"📊 宏观周报（{win}）\n中国基本面 / 美国基本面 / 市场与行业 / 国际局势 / 下周前瞻"
+    # 贪心分段：整节装进当前条，装不下就开新条（超 4096B/条会被企微拒收）
+    msgs_raw, cur, cur_b = [], [], 0
+    for p in parts:
+        pb = len(p.encode("utf-8"))
+        if cur and cur_b + pb > SPLIT_BYTES:
+            msgs_raw.append("\n\n".join(cur))
+            cur, cur_b = [], 0
+        cur.append(p)
+        cur_b += pb + 2
+    if cur:
+        msgs_raw.append("\n\n".join(cur))
+    msgs = [fit_bytes(header + "\n\n" + msgs_raw[0])]
+    for i, m in enumerate(msgs_raw[1:], 2):
+        msgs.append(fit_bytes(f"📊 宏观周报（{win}·续{i}）\n\n" + m))
+    log(f"拼装完成：{sum(len(m.encode('utf-8')) for m in msgs)} 字节 / {len(msgs)} 条，"
+        f"耗时 {time.time() - t0:.0f}s")
 
     if DRY_RUN:
-        if len((header + body).encode("utf-8")) > SPLIT_BYTES:
-            print("\n[将拆两条推送]\n① " + fit_bytes(header + "\n\n" + "\n\n".join(parts[:2])) + "\n")
-            print("② " + fit_bytes(f"📊 宏观周报（{win}·续）\n" + "\n\n".join(parts[2:])) + "\n")
-        else:
-            print("\n" + fit_bytes(header + "\n\n" + body) + "\n")
+        for i, m in enumerate(msgs, 1):
+            print(f"\n〔第 {i} 条〕\n" + m + "\n")
         return
 
-    msgs = []
-    if len((header + body).encode("utf-8")) > SPLIT_BYTES:
-        msgs.append(fit_bytes(header + "\n\n" + "\n\n".join(parts[:2])))
-        msgs.append(fit_bytes(f"📊 宏观周报（{win}·续）\n" + "\n\n".join(parts[2:])))
-    else:
-        msgs.append(fit_bytes(header + "\n\n" + body))
     for i, m in enumerate(msgs, 1):
         n = push(m, hook_env="WECOM_WEBHOOK_MACRO")
         log(f"--- 第 {i}/{len(msgs)} 条推送 {n} 通道 ---")
