@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """每周二抓米哈游游戏上周资讯 → Claude 分类总结 → 推送微信/企微。
 
-由 cron 每周二 10:00 触发（见 games_news.sh + crontab，CRON_TZ=Asia/Shanghai）。
+由 cron 每周二 10:00 触发（run.sh games_news + crontab，CRON_TZ=Asia/Shanghai）。
 
 游戏：原神 / 崩坏：星穹铁道 / 绝区零 / 因缘精灵
 内容：游戏更新、内鬼信息（未实装爆料）、联动信息。
