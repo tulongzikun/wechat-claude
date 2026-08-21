@@ -248,16 +248,17 @@ def recipients() -> list[tuple[str, str]]:
 def _gather_hooks(raw: str, out: list, seen_vars: set, depth: int = 0) -> None:
     """把一段 webhook 配置值里的地址收进 out（递归展开代号）。
 
-    代号 = .env 里定义的任意 `WECOM_*` 变量名——引用时写变量名本身，值可以是
-    单个地址或逗号分隔多个（代号套代号 ≤3 层，seen_vars 防环）。行内 `#` 注释
-    剥离；既不是 http(s) 地址、也不是已定义 WECOM_* 变量名的碎片直接丢弃。
+    代号 = 环境里已定义的 `HOOK_` 开头变量名（如 HOOK_A、HOOK_MOYU_XIEHUI）——
+    引用时写变量名本身，值可以是单个地址或逗号分隔多个（代号套代号 ≤3 层，
+    seen_vars 防环）。行内 `#` 注释剥离；既不是 http(s) 地址、也不是已定义
+    HOOK_* 变量名的碎片直接丢弃。
     """
     if depth > 3:
         return
     for tok in re.split(r"[,\s]+", raw.split("#", 1)[0].strip()):
         if tok.startswith(("http://", "https://")):
             out.append(tok)
-        elif re.fullmatch(r"WECOM_[A-Za-z0-9_]+", tok) and tok not in seen_vars:
+        elif re.fullmatch(r"HOOK_[A-Za-z0-9_]+", tok) and tok not in seen_vars:
             v = os.environ.get(tok, "")
             if v:
                 _gather_hooks(v, out, seen_vars | {tok}, depth + 1)
@@ -268,17 +269,21 @@ def wecom_hooks(hook_env: str = "WECOM_WEBHOOK") -> list[str]:
 
     取值：`hook_env` 指定的任务专用变量（如 WECOM_WEBHOOK_PAPERS），为空回落
     通用 WECOM_WEBHOOK。单个变量里可写多个地址（逗号/空白/换行分隔）——
-    一份内容同时推到多个群，去重保序。值里可用 ` #` 写行内注释；地址可写成
-    代号（= 已定义的 WECOM_* 变量名，如 WECOM_HOOK_A）。
+    一份内容同时推到所有群，去重保序。值里可用 ` #` 写行内注释；地址可写成
+    代号（= 已定义的 HOOK_* 变量名，如 HOOK_A）。配了值却一个群都解析不出时
+    打警告（多半是代号拼错/未定义）。
     """
     raw = os.environ.get(hook_env, "") or os.environ.get("WECOM_WEBHOOK", "")
     hooks: list = []
-    _gather_hooks(raw, hooks, {hook_env, "WECOM_WEBHOOK"})
+    _gather_hooks(raw, hooks, {hook_env})
     seen, uniq = set(), []
     for h in hooks:
         if h not in seen:
             seen.add(h)
             uniq.append(h)
+    if not uniq and raw.split("#", 1)[0].strip():
+        log(f"⚠️ {hook_env} 有配置但没解析出任何群地址（代号未定义或拼写错误？）"
+            f"：{raw.split('#', 1)[0].strip()}")
     return uniq
 
 
