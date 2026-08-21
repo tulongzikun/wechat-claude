@@ -10,7 +10,13 @@ import json
 import os
 import time
 
-from claude import list_jobs, reset_user, submit_background, try_run_inline
+from claude import (
+    handle_monitor_command,
+    list_jobs,
+    reset_user,
+    submit_background,
+    try_run_inline,
+)
 from ilink import ILinkClient
 from login import load_token, login
 
@@ -171,6 +177,11 @@ def main() -> None:
                     else:
                         client.send_message(user_id, context_token,
                                             "没有正在跑的后台作业。")
+
+                # 会话/子进程监控：/sessions /tail /use /procs（claude.py 实现，
+                # 非监控指令返回 None 落到后面的正常分发）
+                elif (mon := handle_monitor_command(stripped, user_id)) is not None:
+                    client.send_message(user_id, context_token, mon)
 
                 # /bg <任务>：显式后台跑
                 elif is_bg_command(stripped):

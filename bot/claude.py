@@ -13,6 +13,8 @@ Agent SDK 会 spawn claude 子进程并继承这些变量，所以不需要单�
 
 import asyncio
 import os
+import re
+import subprocess
 import threading
 import time
 import uuid
@@ -21,6 +23,9 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    get_session_info,
+    get_session_messages,
+    list_sessions,
     query,
 )
 
@@ -225,6 +230,7 @@ def submit_background(text: str, user_id: str, on_done) -> str | None:
             "status": "running",
             "started": time.time(),
             "snippet": text[:40],
+            "session": _sessions.get(user_id),   # 本作业正在续的会话
         }
 
     def _worker():
@@ -239,6 +245,8 @@ def submit_background(text: str, user_id: str, on_done) -> str | None:
                 if job_id in _jobs:
                     _jobs[job_id]["status"] = "done"
                     _jobs[job_id]["finished"] = time.time()
+                    # 作业落到的（可能是新的）会话 id——/use <job_id> 继续它
+                    _jobs[job_id]["session"] = _sessions.get(user_id)
             try:
                 on_done(result)
             except Exception as e:
@@ -264,6 +272,204 @@ def reset_user(user_id: str) -> None:
     注意：若该用户正好有后台作业在跑，在跑的 turn 会把自己的 session 写回，
     可能把重置覆盖掉——所以重置最好在没有 /jobs 进行时发。"""
     _sessions.pop(user_id, None)
+
+
+# ── 会话/子进程监控（SDK 会话管理 API + /proc 扫描）──────────────────────
+# 微信侧指令（main.py 分发到 handle_monitor_command）：
+#   /sessions [N]      列出所有 Claude 会话（跨项目，按最近活动降序）
+#   /tail <ref> [N]    看某会话最近 N 条对话（ref = 上次列表的序号 / id 前缀）
+#   /use <ref>         把当前用户的对话切到指定会话继续（也可接后台 job_id）
+#   /procs             bot 派生的 claude 子进程（含各自续的会话）+ 运行中作业
+# 别名：所有会话/会话列表、会话详情、续会话/继续会话、子进程
+#
+# 关键实现事实（2026-08-20 实测）：
+# - list_sessions() 不带 directory = 跨全部项目，按 last_modified 降序
+# - get_session_messages 的 limit 是从头取（最旧在前）——取尾部要全量读再切片
+# - SDK 派生的 claude CLI 是本进程的后代，cmdline 含 "--resume=<sid>"
+#   （新会话无此 flag），据此把 OS 进程和会话关联起来
+
+_RE_SID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_RE_RESUME = re.compile(r"--resume=([0-9a-f-]{36})")
+
+# 每用户最近一次 /sessions 或 /procs 列出的会话 id（「序号」引用的就是它）
+_last_listed: dict[str, list[str]] = {}
+
+
+def _age(ts_ms: float) -> str:
+    """epoch 毫秒 → 『3分钟前』。"""
+    s = max(0, time.time() - ts_ms / 1000)
+    for unit, div in (("天", 86400), ("小时", 3600), ("分钟", 60)):
+        if s >= div:
+            return f"{int(s // div)}{unit}前"
+    return f"{int(s)}秒前"
+
+
+def _msg_text(sm) -> str:
+    """SessionMessage.message（原始 API dict）→ 可读文本；非文本块跳过。"""
+    content = (sm.message or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _resolve_sid(ref: str, user_id: str) -> str | None:
+    """把 /tail、/use 的参数解析成 session_id：序号 / 完整 id / id 前缀。"""
+    ref = ref.strip().lower()
+    if ref.isdigit():                          # 序号 → 上次列出的会话
+        lst = _last_listed.get(user_id) or []
+        i = int(ref)
+        return lst[i - 1] if 1 <= i <= len(lst) else None
+    if _RE_SID.match(ref):
+        return ref
+    cands = [s.session_id for s in list_sessions(limit=50)
+             if s.session_id.startswith(ref)]  # id 前缀（>=8 位基本唯一）
+    return cands[0] if len(cands) == 1 else None
+
+
+def _cmd_sessions(user_id: str, limit: int) -> str:
+    sessions = list_sessions(limit=limit)
+    _last_listed[user_id] = [s.session_id for s in sessions]
+    lines = []
+    for i, s in enumerate(sessions, 1):
+        title = (s.custom_title or s.summary or s.first_prompt or "（无摘要）")
+        lines.append(f"{i}. {s.session_id[:8]} · {_age(s.last_modified)} · "
+                     f"{title.replace(chr(10), ' ')[:24]}")
+    body = "\n".join(lines) if lines else "（没有找到会话）"
+    return (f"📋 Claude 会话（最近 {len(sessions)} 个，跨项目）：\n{body}\n"
+            "— /tail <序号> 看内容 · /use <序号> 切过去继续")
+
+
+def _cmd_tail(user_id: str, ref: str, n: int) -> str:
+    sid = _resolve_sid(ref, user_id)
+    if not sid:
+        return "⚠️ 找不到会话。先发 /sessions 看列表，再用序号或 id 前缀（>=8位）。"
+    info = get_session_info(sid)
+    if info is None:
+        return f"⚠️ 会话 {sid[:8]} 不存在（可能已被清理）。"
+    msgs = get_session_messages(sid)           # limit 从头取，取尾只能全量读
+    shown = []
+    for m in reversed(msgs):                   # 从最新往回取有文本的 n 条
+        t = _msg_text(m)
+        if not t.strip() or t.startswith("This session is being continued"):
+            continue                           # 跳过空消息和压缩续接样板
+        shown.append(("👤" if m.type == "user" else "🤖")
+                     + " " + t.replace("\n", " ")[:80])
+        if len(shown) >= n:
+            break
+    title = (info.custom_title or info.summary or sid[:8]).replace("\n", " ")
+    head = f"📂 {title[:40]}（共 {len(msgs)} 条，最近 {len(shown)} 条，倒序）"
+    return head + "\n" + "\n".join(shown)
+
+
+def _cmd_use(user_id: str, ref: str) -> str:
+    # 先看是不是后台作业 id → 接它（跑完）的会话
+    with _jobs_guard:
+        job = _jobs.get(ref)
+    if job is not None:
+        if job.get("status") == "running":
+            return f"⏳ job={ref} 还在跑，等完成后再续（/jobs 看状态）。"
+        sid = job.get("session")
+        if not sid:
+            return f"⚠️ job={ref} 没有记录会话 id。"
+    else:
+        sid = _resolve_sid(ref, user_id)
+    if not sid or get_session_info(sid) is None:
+        return "⚠️ 找不到会话。先发 /sessions 看列表，再用序号或 id 前缀。"
+    if _user_lock(user_id).locked():
+        return "⚠️ 你有任务正在跑，完成后再切换，否则正在跑的 turn 会把会话写回覆盖。"
+    _sessions[user_id] = sid
+    return (f"✅ 已切到会话 {sid[:8]}，下一条消息就续在这个会话上"
+            "（发「重置」断开回新会话）。")
+
+
+def _descendants(root: int) -> set[int]:
+    """root 的全部后代 pid（扫 /proc/*/stat 的 ppid 链，一层层往外扩）。"""
+    pp = {}
+    for e in os.scandir("/proc"):
+        if not e.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{e.name}/stat") as f:
+                pp[int(e.name)] = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    desc, frontier = set(), {root}
+    while frontier:
+        nxt = {p for p, q in pp.items() if q in frontier and p not in desc}
+        desc |= nxt
+        frontier = nxt
+    return desc
+
+
+def _claude_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().decode(errors="replace").replace("\0", " ").strip()
+    except OSError:
+        return ""
+
+
+def _cmd_procs(user_id: str) -> str:
+    lines, sids = [], []
+    pids = sorted(p for p in _descendants(os.getpid())
+                  if "claude_agent_sdk" in _claude_cmdline(p))
+    if pids:
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "pid=,etime=,args=", "-p", ",".join(map(str, pids))],
+                capture_output=True, text=True, timeout=5).stdout
+            for ln in out.splitlines():
+                ps_pid, etime, args = ln.strip().split(None, 2)
+                m = _RE_RESUME.search(args)
+                tag = f"续会话 {m.group(1)[:8]}" if m else "新会话"
+                sids.append(m.group(1)) if m else None
+                lines.append(f"• PID {ps_pid} · 已跑 {etime} · {tag}")
+        except Exception as e:
+            lines.append(f"• ps 查询失败：{e}")
+    else:
+        lines.append("• 当前没有在跑的 claude 子进程")
+
+    running = [j for j in list_jobs() if j.get("status") == "running"]
+    jlines = []
+    for j in running:
+        sid = j.get("session")
+        if sid:
+            sids.append(sid)
+        jlines.append(f"• job={j['id']} · {_age(j['started'] * 1000)}开始 · "
+                      f"续{'会话 ' + sid[:8] if sid else '新会话'} · {j.get('snippet', '')}")
+    if jlines:
+        lines.append("后台作业：")
+        lines.extend(jlines)
+
+    if sids:
+        _last_listed[user_id] = sids           # 序号可接着 /use、/tail（空则保留上次）
+    head = f"🔧 claude 子进程（bot PID {os.getpid()} 的后代）："
+    return head + "\n" + "\n".join(lines) + \
+        ("\n— /use <序号> 续接对应会话" if sids else "")
+
+
+def handle_monitor_command(text: str, user_id: str) -> str | None:
+    """会话/子进程监控指令的统一入口。不是这类指令返回 None（main.py 继续分发）。"""
+    parts = text.split()
+    cmd, args = parts[0].lower(), parts[1:]
+    if cmd in ("/sessions", "所有会话", "会话列表"):
+        limit = 10
+        if args and args[0].isdigit():
+            limit = min(int(args[0]), 30)
+        return _cmd_sessions(user_id, limit)[:1500]
+    if cmd in ("/tail", "会话详情") and args:
+        n = 6
+        if len(args) > 1 and args[1].isdigit():
+            n = min(int(args[1]), 12)
+        return _cmd_tail(user_id, args[0], n)[:1500]
+    if cmd in ("/use", "续会话", "继续会话") and args:
+        return _cmd_use(user_id, args[0])
+    if cmd in ("/procs", "子进程", "/ps"):
+        return _cmd_procs(user_id)[:1500]
+    return None
 
 
 if __name__ == "__main__":
