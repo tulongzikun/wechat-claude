@@ -292,6 +292,73 @@ def push_wecom(text: str, hook_env: str = "WECOM_WEBHOOK") -> int:
     return sent
 
 
+_WECOM_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+
+
+def push_wecom_media(file_path: str, hook_env: str = "WECOM_WEBHOOK") -> int:
+    """企微群机器人推送图片/文件（区别于 push_wecom 的纯文本/markdown）。
+
+    - 图片（按扩展名，≤2MB）：{msgtype:image, base64+md5} 直接发，无需上传；
+    - 其他文件（≤20MB）：先 POST upload_media（multipart，字段名 media）换
+      media_id（仅 3 天有效、绑定该机器人 key——每个群各自的 key 都要传一遍），
+      再 {msgtype:file, file:{media_id}} 发送。
+    webhook key 从各群地址的 ?key= 里取。返回成功群数。
+    """
+    hooks = wecom_hooks(hook_env)
+    if not hooks:
+        return 0
+    import base64
+    import hashlib
+    from urllib.parse import parse_qs, urlparse
+
+    import requests  # 延迟 import
+
+    ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+    is_image = ext in _WECOM_IMAGE_EXTS
+    size = os.path.getsize(file_path)
+    if is_image and size > 2 * 1024 * 1024:
+        log(f"  ⚠️ 企微图片上限 2MB，跳过（{file_path} {size}B）")
+        return 0
+    if not is_image and size > 20 * 1024 * 1024:
+        log(f"  ⚠️ 企微文件上限 20MB，跳过（{file_path} {size}B）")
+        return 0
+
+    sent = 0
+    for i, hook in enumerate(hooks, 1):
+        tag = f"{i}/{len(hooks)}" if len(hooks) > 1 else ""
+        try:
+            if is_image:
+                raw = open(file_path, "rb").read()
+                body = {"msgtype": "image",
+                        "image": {"base64": base64.b64encode(raw).decode(),
+                                  "md5": hashlib.md5(raw).hexdigest()}}
+            else:
+                key = parse_qs(urlparse(hook).query).get("key", [""])[0]
+                if not key:
+                    log(f"  ⚠️ 企微 webhook{tag} 无 key，跳过文件上传")
+                    continue
+                up = requests.post(
+                    "https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media",
+                    params={"key": key, "type": "file"},
+                    files={"media": open(file_path, "rb")}, timeout=60)
+                d = up.json()
+                if d.get("errcode") != 0:
+                    log(f"  ⚠️ 企微文件上传失败{tag}: {d}")
+                    continue
+                body = {"msgtype": "file", "file": {"media_id": d["media_id"]}}
+            r = requests.post(hook, json=body, timeout=15)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("errcode") != 0:
+                log(f"  ⚠️ 企微媒体推送失败{tag}: {d}")
+                continue
+            log(f"  📨 已推送 -> 企微群机器人{tag}（{'图片' if is_image else '文件'}）")
+            sent += 1
+        except Exception as e:
+            log(f"  ⚠️ 企微媒体推送失败{tag}: {e}")
+    return sent
+
+
 def push_ilink(text: str) -> int:
     """ilink 微信推送。context_token 来自 latest_ctx.json（bot 落盘），约 24h 时效。"""
     tok = load_json(TOKEN_FILE, {})
