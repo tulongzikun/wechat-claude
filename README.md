@@ -139,20 +139,24 @@ bash jobs/run.sh daily_update --dry-run  # 定时任务试跑（只打印不推�
 bash jobs/run.sh weekly_papers --dry-run
 ```
 
-## Bot 指令（微信里直接发）
+## Bot 指令（微信里直接发，均以 `/` 开头）
 
 | 指令 | 作用 |
 |---|---|
-| `重置` / `reset` | 清空当前用户的对话，下条消息开新会话 |
+| `/help` | 指令一览 |
 | `/bg <任务>` | 后台跑长任务（完成推回，不占主循环） |
 | `/jobs` | 看进行中的后台作业 |
-| `/sessions [N]` | 列出所有 Claude 会话（跨项目，按最近活动降序；`所有会话` 同义） |
-| `/tail <序号\|id前缀> [N]` | 看某会话最近 N 条对话（`会话详情` 同义） |
-| `/use <序号\|id前缀\|job_id>` | 把当前对话切到指定会话/某后台作业的会话继续（`续会话` 同义） |
-| `/procs` | bot 派生的 claude 子进程（PID、已跑时长、各自续的会话）+ 运行中作业（`子进程` 同义） |
+| `/reset` | 清空当前用户的对话，下条消息开新会话 |
+| `/sessions [N]` | 列出所有 Claude 会话（跨项目，按最近活动降序） |
+| `/tail <序号\|id前缀> [N]` | 看某会话最近 N 条对话 |
+| `/use <序号\|id前缀\|job_id>` | 把当前对话切到指定会话/某后台作业的会话继续 |
+| `/exit` | 退出当前会话（transcript 保留，可 `/use` 找回） |
+| `/del <序号\|id前缀>` | 硬删某会话（不可恢复；删除当前会话时一并退出） |
+| `/procs` | bot 派生的 claude 子进程（PID、已跑时长、各自续的会话）+ 运行中作业 |
 
-会话监控基于 Claude Agent SDK 的会话管理 API（`list_sessions` /
-`get_session_messages` 等，读写 `~/.claude` 的 transcript）；子进程监控扫
+普通文字一律当对话内容发给 agent，不作为指令触发。会话监控基于 Claude
+Agent SDK 的会话管理 API（`list_sessions` / `get_session_messages` /
+`delete_session` 等，读写 `~/.claude` 的 transcript）；子进程监控扫
 `/proc` 找 bot 的 claude 后代进程，从命令行的 `--resume=<id>` 关联到会话。
 bot 重启会丢内存里的会话指针——用 `/sessions` + `/use` 可找回任意历史会话继续。
 
