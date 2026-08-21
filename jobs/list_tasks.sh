@@ -9,14 +9,16 @@ CONF="$DIR/tasks.conf"
 [ -f "$DIR/../.env" ] && { set -a; source "$DIR/../.env" 2>/dev/null; set +a; }
 
 # 统计一个 WECOM_WEBHOOK* 变量值里配了几个群：剥行内注释后按逗号/空白切 token，
-# http(s) URL 直接计数；代号（.env 里 WECOM_HOOK_<代号> 已定义）计 1 个群。
+# http(s) URL 直接计数；代号（= 已定义的 WECOM_* 变量名，如 WECOM_HOOK_A）
+# 展开其值再计（递归 ≤3 层防环）。
 count_groups() {
-    local raw="${1%%#*}" tok nm n=0
+    local raw="${1%%#*}" tok val n=0 depth="${2:-0}"
+    [ "$depth" -ge 3 ] && { echo 0; return; }
     for tok in $(echo "$raw" | tr ',' ' '); do
         case "$tok" in http*) n=$((n + 1)); continue ;; esac
-        if [[ "$tok" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
-            nm="WECOM_HOOK_$tok"
-            [ -n "${!nm:-}" ] && n=$((n + 1))
+        if [[ "$tok" =~ ^WECOM_[A-Za-z0-9_]+$ ]]; then
+            val="${!tok:-}"
+            [ -n "$val" ] && n=$((n + $(count_groups "$val" "$((depth + 1))")))
         fi
     done
     echo "$n"
