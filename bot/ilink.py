@@ -12,13 +12,17 @@ iLink 是微信官方提供的 Bot 协议，本身只负责消息收发，不做
 """
 
 import base64
+import hashlib
 import os
 import uuid
+from urllib.parse import quote
 
 import requests
 
 # 未登录时的接口前缀（取二维码 / 查状态走这里）
 BASE_URL = "https://ilinkai.weixin.qq.com"
+# 媒体文件 CDN（上传/下载都走这里）
+CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 
 class ILinkError(Exception):
@@ -131,3 +135,116 @@ class ILinkClient:
         r = requests.post(url, json=payload, headers=self._headers(), timeout=10)
         r.raise_for_status()
         return r.json()
+
+    # ---------- 媒体消息（文件/图片/视频） ----------
+    # 三步（协议参考 openclaw-weixin 源码，文档没写全的部分都在那里）：
+    #   ① getuploadurl：报 filekey/media_type/大小/MD5/aeskey(hex) 换 upload_param
+    #   ② POST 密文到 CDN：URL = /upload?encrypted_query_param=<upload_param>&filekey=<filekey>，
+    #      body = AES-128-ECB(PKCS7) 加密后的字节；响应 header x-encrypted-param = 下载参数
+    #   ③ sendmessage：item 引用 CDN——media:{encrypt_query_param, aes_key(base64),
+    #      encrypt_type:1}，按类型加 image_item/video_item/file_item
+    # 注意两套枚举别混：getuploadurl 的 media_type（图1/视频2/文件3/语音4）≠
+    # item_list 的 type（文本1/图2/语音3/文件4/视频5）。caption 单独发一条文本。
+
+    _IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
+    _VIDEO_EXTS = {"mp4", "mov", "m4v", "mkv"}
+
+    @staticmethod
+    def _aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+        """AES-128-ECB + PKCS7 填充（CDN 要求的加密方式）。"""
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.padding import PKCS7
+        padder = PKCS7(128).padder()
+        padded = padder.update(data) + padder.finalize()
+        enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+        return enc.update(padded) + enc.finalize()
+
+    def upload_media(self, file_path: str, to_user_id: str, media_type: int) -> dict:
+        """上传文件到微信 CDN。返回 {download_param, aes_key_b64, raw_size,
+        cipher_size, file_name}；失败抛 ILinkError。"""
+        with open(file_path, "rb") as f:
+            raw = f.read()
+        key = os.urandom(16)
+        filekey = os.urandom(16).hex()
+        # 密文大小：明文 + 1~16 字节 PKCS7 填充，对齐 16
+        cipher_size = ((len(raw) + 16) // 16) * 16
+        r = requests.post(
+            f"{self.baseurl}/ilink/bot/getuploadurl",
+            json={
+                "filekey": filekey,
+                "media_type": media_type,          # 1图 2视频 3文件 4语音
+                "to_user_id": to_user_id,
+                "rawsize": len(raw),
+                "rawfilemd5": hashlib.md5(raw).hexdigest(),
+                "filesize": cipher_size,
+                "no_need_thumb": True,
+                "aeskey": key.hex(),
+                "base_info": {"channel_version": "1.0.2"},
+            },
+            headers=self._headers(), timeout=15,
+        )
+        r.raise_for_status()
+        upload_param = (r.json() or {}).get("upload_param")
+        if not upload_param:
+            raise ILinkError(f"getuploadurl 未返回 upload_param：{r.text[:200]}")
+        url = (f"{CDN_BASE}/upload?encrypted_query_param={quote(upload_param, safe='')}"
+               f"&filekey={quote(filekey, safe='')}")
+        res = requests.post(
+            url, data=self._aes_ecb_encrypt(raw, key),
+            headers={"Content-Type": "application/octet-stream"}, timeout=120,
+        )
+        if res.status_code >= 400:
+            raise ILinkError(f"CDN 上传失败 {res.status_code}："
+                             f"{res.headers.get('x-error-message', res.text[:200])}")
+        download_param = res.headers.get("x-encrypted-param")
+        if not download_param:
+            raise ILinkError(f"CDN 响应缺 x-encrypted-param：{res.text[:200]}")
+        return {"download_param": download_param,
+                "aes_key_b64": base64.b64encode(key).decode(),
+                "raw_size": len(raw), "cipher_size": cipher_size,
+                "file_name": os.path.basename(file_path)}
+
+    def send_media(self, to_user_id: str, context_token: str,
+                   file_path: str, caption: str = "") -> dict:
+        """发送文件/图片/视频（按扩展名自动路由）。caption 有值时先发一条文本。"""
+        ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+        media = None
+        if ext in self._IMAGE_EXTS:
+            up = self.upload_media(file_path, to_user_id, media_type=1)
+            media = {"type": 2, "image_item": {
+                "media": self._cdn_ref(up), "mid_size": up["cipher_size"]}}
+        elif ext in self._VIDEO_EXTS:
+            up = self.upload_media(file_path, to_user_id, media_type=2)
+            media = {"type": 5, "video_item": {
+                "media": self._cdn_ref(up), "video_size": up["cipher_size"]}}
+        else:
+            up = self.upload_media(file_path, to_user_id, media_type=3)
+            media = {"type": 4, "file_item": {
+                "media": self._cdn_ref(up),
+                "file_name": up["file_name"], "len": str(up["raw_size"])}}
+        if caption:
+            self.send_message(to_user_id, context_token, caption)
+        payload = {
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to_user_id,
+                "client_id": uuid.uuid4().hex,   # 每条唯一，同 send_message
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": context_token,
+                "item_list": [media],
+            }
+        }
+        r = requests.post(f"{self.baseurl}/ilink/bot/sendmessage",
+                          json=payload, headers=self._headers(), timeout=15)
+        r.raise_for_status()
+        resp = r.json()
+        # 成功时只回 message_id；失败才有 ret（如 token 过期 ret=-2）
+        if resp.get("ret", 0) != 0:
+            raise ILinkError(f"sendmessage 失败：{resp}")
+        return resp
+
+    @staticmethod
+    def _cdn_ref(up: dict) -> dict:
+        return {"encrypt_query_param": up["download_param"],
+                "aes_key": up["aes_key_b64"], "encrypt_type": 1}

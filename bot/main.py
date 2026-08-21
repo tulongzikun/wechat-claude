@@ -11,6 +11,7 @@ import os
 import time
 
 from claude import (
+    ADMIN_USERS,
     handle_monitor_command,
     list_jobs,
     reset_user,
@@ -231,6 +232,31 @@ def main() -> None:
                                             f"🆕 已新起子进程 job={job_id}（全新会话、不带历史、"
                                             f"不影响当前对话），跑完发回这里。\n任务：{task[:80]}")
                         print(f"{_ts()} 🆕 -> [{user_id}] 全新会话 job={job_id}：{task[:60]}")
+
+                # /file <路径> [说明]：把服务器上的文件/图片/视频发到微信（按扩展名路由）。
+                # 这是任意文件读取通道，仅 WECHAT_ADMIN_USERS 可用。
+                elif stripped == "/file" or stripped.startswith("/file "):
+                    parts = stripped.split(None, 2)
+                    path = os.path.expanduser(parts[1]) if len(parts) > 1 else ""
+                    caption = parts[2] if len(parts) > 2 else ""
+                    if ADMIN_USERS and user_id not in ADMIN_USERS:
+                        client.send_message(user_id, context_token, "⚠️ /file 仅管理员可用。")
+                    elif not path:
+                        client.send_message(user_id, context_token,
+                                            "用法：/file <服务器上的文件路径> [附言]，例如 /file ~/workspace/wechat/README.md 项目说明")
+                    elif not os.path.isfile(path):
+                        client.send_message(user_id, context_token, f"⚠️ 文件不存在：{path}")
+                    elif os.path.getsize(path) > 30 * 1024 * 1024:
+                        client.send_message(user_id, context_token, "⚠️ 文件超过 30MB，不发。")
+                    else:
+                        try:
+                            client.send_media(user_id, context_token, path,
+                                              caption or f"📄 {os.path.basename(path)}")
+                            client.send_message(user_id, context_token, f"✅ 已发送：{path}")
+                            print(f"{_ts()} 📎 -> [{user_id}] 文件 {path}")
+                        except Exception as e:
+                            client.send_message(user_id, context_token, f"⚠️ 发送失败：{e}")
+                            print(f"{_ts()} ⚠️ [{user_id}] 文件发送失败 {path}：{e}")
 
                 else:
                     est = estimate_seconds(text)
