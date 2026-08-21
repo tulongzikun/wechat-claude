@@ -154,6 +154,7 @@ bash jobs/run.sh weekly_papers --dry-run
 | `/exit` | 退出当前会话（transcript 保留，可 `/use` 找回） |
 | `/del <序号\|id前缀>` | 硬删某会话（不可恢复；删除当前会话时一并退出） |
 | `/procs` | bot 派生的 claude 子进程（PID、已跑时长、各自续的会话）+ 运行中作业 |
+| `/file <路径> [附言]` | 把服务器上的文件/图片/视频发到微信（仅管理员；AES-128-ECB 加密上传微信 CDN） |
 
 普通文字一律当对话内容发给 agent，不作为指令触发。会话监控基于 Claude
 Agent SDK 的会话管理 API（`list_sessions` / `get_session_messages` /
