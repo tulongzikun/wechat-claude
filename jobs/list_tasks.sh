@@ -8,7 +8,19 @@ CONF="$DIR/tasks.conf"
 # 载入 .env（只为了判断变量是否已配，不回显任何真实值）
 [ -f "$DIR/../.env" ] && { set -a; source "$DIR/../.env" 2>/dev/null; set +a; }
 
-count_groups() { echo "$1" | grep -o 'key=' | wc -l; }
+# 统计一个 WECOM_WEBHOOK* 变量值里配了几个群：剥行内注释后按逗号/空白切 token，
+# http(s) URL 直接计数；代号（.env 里 WECOM_HOOK_<代号> 已定义）计 1 个群。
+count_groups() {
+    local raw="${1%%#*}" tok nm n=0
+    for tok in $(echo "$raw" | tr ',' ' '); do
+        case "$tok" in http*) n=$((n + 1)); continue ;; esac
+        if [[ "$tok" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
+            nm="WECOM_HOOK_$tok"
+            [ -n "${!nm:-}" ] && n=$((n + 1))
+        fi
+    done
+    echo "$n"
+}
 
 if [ ! -f "$CONF" ]; then
     echo "⚠️ 注册表 $CONF 不存在"
