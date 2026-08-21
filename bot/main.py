@@ -110,7 +110,7 @@ def push_back(client: ILinkClient, user_id: str, text: str) -> None:
         print(f"{_ts()} ⚠️ [{user_id}] 后台回推失败：{e}")
 
 
-_BG_PREFIXES = ("/bg ", "后台:", "后台：")
+_BG_PREFIXES = ("/bg ",)   # 指令只认 / 前缀（裸 /bg 在分流里单独给用法提示）
 
 
 def is_bg_command(stripped: str) -> bool:
@@ -159,14 +159,14 @@ def main() -> None:
 
                 # ---- 指令分流 ----
 
-                # /reset：清空该用户的 agent 会话
-                if stripped in ("重置", "reset", "/reset"):
+                # /reset：清空该用户的 agent 会话（同 /exit）
+                if stripped == "/reset":
                     reset_user(user_id)
                     client.send_message(user_id, context_token,
                                         "已清空对话历史，可以重新开始啦 ✨")
 
                 # /jobs：看自己的后台作业状态
-                elif stripped in ("/jobs", "任务", "作业", "/status"):
+                elif stripped == "/jobs":
                     running = [j for j in list_jobs(user_id)
                                if j.get("status") == "running"]
                     if running:
@@ -178,10 +178,15 @@ def main() -> None:
                         client.send_message(user_id, context_token,
                                             "没有正在跑的后台作业。")
 
-                # 会话/子进程监控：/sessions /tail /use /procs（claude.py 实现，
-                # 非监控指令返回 None 落到后面的正常分发）
+                # 会话/子进程监控：/sessions /tail /use /exit /del /procs /help
+                #（claude.py 实现，非监控指令返回 None 落到后面的正常分发）
                 elif (mon := handle_monitor_command(stripped, user_id)) is not None:
                     client.send_message(user_id, context_token, mon)
+
+                # 裸 /bg：给用法（带任务的 "/bg xxx" 走下面的分支）
+                elif stripped == "/bg":
+                    client.send_message(user_id, context_token,
+                                        "用法：/bg <要办的事>，例如 /bg 读 novel/outline.md 并续写第三章")
 
                 # /bg <任务>：显式后台跑
                 elif is_bg_command(stripped):
@@ -197,7 +202,7 @@ def main() -> None:
                     )
                     if job_id is None:
                         client.send_message(user_id, context_token,
-                                            "⏳ 上一条还在跑，等它完成（/jobs 看状态）或发「重置」后再试。")
+                                            "⏳ 上一条还在跑，等它完成（/jobs 看状态）或发 /exit 后再试。")
                     else:
                         client.send_message(user_id, context_token,
                                             f"🚀 已派后台 job={job_id}，跑完发回这里。\n任务：{task[:80]}")
@@ -214,7 +219,7 @@ def main() -> None:
                         )
                         if job_id is None:
                             client.send_message(user_id, context_token,
-                                                "⏳ 上一条还在跑，等它完成或发「重置」。")
+                                                "⏳ 上一条还在跑，等它完成或发 /exit。")
                         else:
                             client.send_message(user_id, context_token,
                                                 f"⏳ 这个要点时间，已转后台 job={job_id}，跑完发回。")
@@ -227,7 +232,7 @@ def main() -> None:
                         reply = try_run_inline(text, user_id)
                         if reply is None:
                             client.send_message(user_id, context_token,
-                                                "⏳ 上一条还在处理，等完成或发「重置」。")
+                                                "⏳ 上一条还在处理，等完成或发 /exit。")
                         else:
                             client.send_message(user_id, context_token, reply)
                             print(f"{_ts()} 🤖 -> [{user_id}] "

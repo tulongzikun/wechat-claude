@@ -23,6 +23,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    delete_session,
     get_session_info,
     get_session_messages,
     list_sessions,
@@ -267,7 +268,7 @@ def ask_claude(text: str, user_id: str = "default") -> str:
 
 
 def reset_user(user_id: str) -> None:
-    """清空某用户的 agent 会话（用户发"重置"时调用，下条消息开新会话）。
+    """清空某用户的 agent 会话（/reset 或 /exit 时调用，下条消息开新会话）。
 
     注意：若该用户正好有后台作业在跑，在跑的 turn 会把自己的 session 写回，
     可能把重置覆盖掉——所以重置最好在没有 /jobs 进行时发。"""
@@ -275,12 +276,14 @@ def reset_user(user_id: str) -> None:
 
 
 # ── 会话/子进程监控（SDK 会话管理 API + /proc 扫描）──────────────────────
-# 微信侧指令（main.py 分发到 handle_monitor_command）：
+# 微信侧指令（只认 / 前缀，无文字别名；main.py 分发到 handle_monitor_command）：
 #   /sessions [N]      列出所有 Claude 会话（跨项目，按最近活动降序）
 #   /tail <ref> [N]    看某会话最近 N 条对话（ref = 上次列表的序号 / id 前缀）
 #   /use <ref>         把当前用户的对话切到指定会话继续（也可接后台 job_id）
+#   /exit              退出当前会话（下条消息开新会话；原会话保留可 /use 找回）
+#   /del <ref>         删除某会话（磁盘 transcript 硬删，不可恢复）
 #   /procs             bot 派生的 claude 子进程（含各自续的会话）+ 运行中作业
-# 别名：所有会话/会话列表、会话详情、续会话/继续会话、子进程
+#   /help              指令一览
 #
 # 关键实现事实（2026-08-20 实测）：
 # - list_sessions() 不带 directory = 跨全部项目，按 last_modified 降序
@@ -382,7 +385,7 @@ def _cmd_use(user_id: str, ref: str) -> str:
         return "⚠️ 你有任务正在跑，完成后再切换，否则正在跑的 turn 会把会话写回覆盖。"
     _sessions[user_id] = sid
     return (f"✅ 已切到会话 {sid[:8]}，下一条消息就续在这个会话上"
-            "（发「重置」断开回新会话）。")
+            "（发 /exit 断开回新会话）。")
 
 
 def _descendants(root: int) -> set[int]:
@@ -451,24 +454,80 @@ def _cmd_procs(user_id: str) -> str:
         ("\n— /use <序号> 续接对应会话" if sids else "")
 
 
+def _cmd_exit(user_id: str) -> str:
+    """退出当前会话：只断开指针（下条消息开新会话），transcript 保留。"""
+    sid = _sessions.get(user_id)
+    reset_user(user_id)
+    return (f"👋 已退出会话 {sid[:8] if sid else '（无）'}，下条消息开新会话。\n"
+            "原会话仍在磁盘上，/sessions + /use 可随时找回继续；"
+            "要彻底删除用 /del <序号|id>。")
+
+
+def _cmd_del(user_id: str, ref: str) -> str:
+    sid = _resolve_sid(ref, user_id)
+    if not sid or get_session_info(sid) is None:
+        return "⚠️ 找不到会话。先发 /sessions 看列表，再用序号或 id 前缀。"
+    # 有后台作业正 resume 它时不许删（删 transcript 会把在跑的 turn 弄坏）
+    for j in list_jobs():
+        if j.get("status") == "running" and j.get("session") == sid:
+            return f"⏳ job={j['id']} 正在这个会话上跑，等它完成后再删。"
+    try:
+        delete_session(sid)               # 硬删：JSONL + 子代理 transcript
+    except Exception as e:
+        return f"⚠️ 删除失败：{e}"
+    if _sessions.get(user_id) == sid:     # 删的是当前会话 → 一并退出
+        reset_user(user_id)
+        detached = "（是当前会话，已一并退出）"
+    else:
+        detached = ""
+    _last_listed[user_id] = [s for s in (_last_listed.get(user_id) or [])
+                             if s != sid]
+    return f"🗑️ 已删除会话 {sid[:8]}{detached}，不可恢复。"
+
+
+_HELP = """📖 Bot 指令（均以 / 开头）
+• /sessions [N] — 列出所有 Claude 会话
+• /tail <序号|id> [N] — 看某会话最近 N 条对话
+• /use <序号|id|job_id> — 切到某会话继续
+• /exit — 退出当前会话（保留，可 /use 找回）
+• /del <序号|id> — 删除某会话（不可恢复）
+• /procs — claude 子进程与后台作业
+• /bg <任务> — 后台跑长任务（完成推回）
+• /jobs — 后台作业状态
+• /reset — 同 /exit（清空当前对话）"""
+
+
 def handle_monitor_command(text: str, user_id: str) -> str | None:
-    """会话/子进程监控指令的统一入口。不是这类指令返回 None（main.py 继续分发）。"""
+    """会话/子进程监控指令的统一入口（只认 / 前缀指令）。
+    不是这类指令返回 None（main.py 继续分发）。裸指令缺参数时给用法提示。"""
     parts = text.split()
     cmd, args = parts[0].lower(), parts[1:]
-    if cmd in ("/sessions", "所有会话", "会话列表"):
+    if cmd == "/help":
+        return _HELP
+    if cmd == "/sessions":
         limit = 10
         if args and args[0].isdigit():
             limit = min(int(args[0]), 30)
-        return _cmd_sessions(user_id, limit)[:1500]
-    if cmd in ("/tail", "会话详情") and args:
+        return _cmd_sessions(user_id, limit)[:2000]
+    if cmd == "/tail":
+        if not args:
+            return "用法：/tail <序号|id前缀> [条数]。先 /sessions 看列表。"
         n = 6
         if len(args) > 1 and args[1].isdigit():
             n = min(int(args[1]), 12)
-        return _cmd_tail(user_id, args[0], n)[:1500]
-    if cmd in ("/use", "续会话", "继续会话") and args:
+        return _cmd_tail(user_id, args[0], n)[:2000]
+    if cmd == "/use":
+        if not args:
+            return "用法：/use <序号|id前缀|job_id>。先 /sessions 或 /procs 看列表。"
         return _cmd_use(user_id, args[0])
-    if cmd in ("/procs", "子进程", "/ps"):
-        return _cmd_procs(user_id)[:1500]
+    if cmd == "/exit":
+        return _cmd_exit(user_id)
+    if cmd == "/del":
+        if not args:
+            return "用法：/del <序号|id前缀>（硬删不可恢复；只断开用 /exit）。"
+        return _cmd_del(user_id, args[0])
+    if cmd == "/procs":
+        return _cmd_procs(user_id)[:2000]
     return None
 
 
