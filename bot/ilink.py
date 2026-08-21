@@ -199,8 +199,12 @@ class ILinkClient:
         download_param = res.headers.get("x-encrypted-param")
         if not download_param:
             raise ILinkError(f"CDN 响应缺 x-encrypted-param：{res.text[:200]}")
+        # ⚠️ aes_key 编码（对齐 openclaw-weixin 参考实现，别改回 base64(原始16字节)）：
+        # 服务端在 getuploadurl 登记的是 hex 字符串，客户端按 base64 解出后当 hex 串
+        # 再解一次才是真 key。即 base64(key.hex() 的 UTF-8 字节)，44 字符——
+        # 直接 base64(原始 key) 会被服务端收下(message_id)但客户端解不开图。
         return {"download_param": download_param,
-                "aes_key_b64": base64.b64encode(key).decode(),
+                "aes_key_b64": base64.b64encode(key.hex().encode()).decode(),
                 "raw_size": len(raw), "cipher_size": cipher_size,
                 "file_name": os.path.basename(file_path)}
 
