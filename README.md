@@ -139,6 +139,23 @@ bash jobs/run.sh daily_update --dry-run  # 定时任务试跑（只打印不推�
 bash jobs/run.sh weekly_papers --dry-run
 ```
 
+## Bot 指令（微信里直接发）
+
+| 指令 | 作用 |
+|---|---|
+| `重置` / `reset` | 清空当前用户的对话，下条消息开新会话 |
+| `/bg <任务>` | 后台跑长任务（完成推回，不占主循环） |
+| `/jobs` | 看进行中的后台作业 |
+| `/sessions [N]` | 列出所有 Claude 会话（跨项目，按最近活动降序；`所有会话` 同义） |
+| `/tail <序号\|id前缀> [N]` | 看某会话最近 N 条对话（`会话详情` 同义） |
+| `/use <序号\|id前缀\|job_id>` | 把当前对话切到指定会话/某后台作业的会话继续（`续会话` 同义） |
+| `/procs` | bot 派生的 claude 子进程（PID、已跑时长、各自续的会话）+ 运行中作业（`子进程` 同义） |
+
+会话监控基于 Claude Agent SDK 的会话管理 API（`list_sessions` /
+`get_session_messages` 等，读写 `~/.claude` 的 transcript）；子进程监控扫
+`/proc` 找 bot 的 claude 后代进程，从命令行的 `--resume=<id>` 关联到会话。
+bot 重启会丢内存里的会话指针——用 `/sessions` + `/use` 可找回任意历史会话继续。
+
 首次运行会生成二维码（`qr.png`），**在手机微信里**扫码登录（二维码页依赖
 WeixinJSBridge，普通浏览器打不开）。登录后 `token.json` 自动写入，下次复用免扫码。
 
