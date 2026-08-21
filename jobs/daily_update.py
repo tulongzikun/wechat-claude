@@ -245,19 +245,34 @@ def recipients() -> list[tuple[str, str]]:
     return out
 
 
+def _expand_hook(tok: str, _depth: int = 0) -> str:
+    """webhook 代号展开：.env 里 `WECOM_HOOK_<代号>=<完整地址>` 定义的代号，
+    可在任何 WECOM_WEBHOOK* 变量的值里直接写代号（支持代号套代号，≤3 层）。
+    URL 含 "://" 不会被误当代号；未定义的代号原样返回（上层按非 URL 丢弃）。
+    """
+    if _depth >= 3 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", tok or ""):
+        return tok
+    v = (os.environ.get(f"WECOM_HOOK_{tok}", "") or "").split("#", 1)[0].strip()
+    return _expand_hook(v, _depth + 1) if v else tok
+
+
 def wecom_hooks(hook_env: str = "WECOM_WEBHOOK") -> list[str]:
     """按任务解析企微 webhook 列表（可推多个群）。
 
     取值：`hook_env` 指定的任务专用变量（如 WECOM_WEBHOOK_PAPERS），为空回落
     通用 WECOM_WEBHOOK。单个变量里可写多个地址（逗号/空白/换行分隔）——
-    一份内容同时推到多个群。去重保序。
+    一份内容同时推到多个群，去重保序。
+    值里可用 ` #` 写行内注释（# 及之后忽略）；地址可换成 WECOM_HOOK_<代号>
+    定义的代号。展开后非 http(s):// 的碎片一律丢弃（防注释残片被当群地址）。
     """
     raw = os.environ.get(hook_env, "") or os.environ.get("WECOM_WEBHOOK", "")
+    raw = raw.split("#", 1)[0]          # 行内注释
     seen, hooks = set(), []
-    for h in re.split(r"[,\s]+", raw.strip()):
-        if h and h not in seen:
-            seen.add(h)
-            hooks.append(h)
+    for tok in re.split(r"[,\s]+", raw.strip()):
+        url = _expand_hook(tok)
+        if url.startswith(("http://", "https://")) and url not in seen:
+            seen.add(url)
+            hooks.append(url)
     return hooks
 
 
