@@ -176,25 +176,27 @@ async def _agent_turn(
     return answer or "（agent 这一轮没有返回文本）", new_sid
 
 
-def _run_turn_sync(text: str, user_id: str) -> str:
-    """跑一轮 agent（含超时与 session 更新），返回给用户的文本。
+def _run_turn_sync(text: str, user_id: str, isolated: bool = False) -> tuple[str, str | None]:
+    """跑一轮 agent（含超时），返回 (回复文本, 本轮落到的 session_id)。
 
-    调用方必须已持有该 user 的锁——保证同一 session 不会被并发 resume。
+    调用方一般应已持有该 user 的锁——保证同一 session 不会被并发 resume。
     每次新建临时 event loop 驱动 agent（可安全用于主线程外的后台线程）。
+    isolated=True：不读也不写该用户的会话指针——起全新会话跑一次性任务，
+    与该用户正在续的其他会话互不冲突（transcript 不同，可并行）。
     """
-    sid = _sessions.get(user_id)
+    sid = None if isolated else _sessions.get(user_id)
     try:
         answer, new_sid = asyncio.run(
             asyncio.wait_for(_agent_turn(text, sid, user_id), timeout=TURN_TIMEOUT)
         )
     except asyncio.TimeoutError:
         return (f"⏳ 处理超时（>{TURN_TIMEOUT}s）。"
-                f"这类长任务建议用 /bg <内容> 跑后台，不卡循环、不撞超时。")
+                f"这类长任务建议用 /bg 或 /new 跑后台，不卡循环、不撞超时。", sid)
     except Exception as e:
-        return f"⚠️ agent 出错：{e}"
-    if new_sid:
+        return f"⚠️ agent 出错：{e}", sid
+    if new_sid and not isolated:
         _sessions[user_id] = new_sid
-    return answer
+    return answer, new_sid
 
 
 def try_run_inline(text: str, user_id: str = "default") -> str | None:
@@ -207,7 +209,7 @@ def try_run_inline(text: str, user_id: str = "default") -> str | None:
     if not lk.acquire(blocking=False):
         return None
     try:
-        return _run_turn_sync(text, user_id)
+        return _run_turn_sync(text, user_id)[0]
     finally:
         lk.release()
 
@@ -232,12 +234,13 @@ def submit_background(text: str, user_id: str, on_done) -> str | None:
             "started": time.time(),
             "snippet": text[:40],
             "session": _sessions.get(user_id),   # 本作业正在续的会话
+            "kind": "bg",
         }
 
     def _worker():
-        result = ""
+        result, sid = "", None
         try:
-            result = _run_turn_sync(text, user_id)
+            result, sid = _run_turn_sync(text, user_id)
         except Exception as e:  # _run_turn_sync 已兜底，这里是双保险
             result = f"⚠️ 后台作业异常：{e}"
         finally:
@@ -247,7 +250,7 @@ def submit_background(text: str, user_id: str, on_done) -> str | None:
                     _jobs[job_id]["status"] = "done"
                     _jobs[job_id]["finished"] = time.time()
                     # 作业落到的（可能是新的）会话 id——/use <job_id> 继续它
-                    _jobs[job_id]["session"] = _sessions.get(user_id)
+                    _jobs[job_id]["session"] = sid or _sessions.get(user_id)
             try:
                 on_done(result)
             except Exception as e:
@@ -257,12 +260,63 @@ def submit_background(text: str, user_id: str, on_done) -> str | None:
     return job_id
 
 
+# 同一用户同时跑的 /new 全新会话作业数上限（不限会膨胀失控）
+_MAX_FRESH_PER_USER = 2
+
+
+def submit_fresh(text: str, user_id: str, on_done) -> str | None:
+    """起一个【全新会话】的后台子进程跑任务（不 resume 任何历史）。
+
+    与 submit_background 的三点区别：
+    - 不占该用户的会话锁——全新 transcript 与在续会话无冲突，可与当前对话
+      并行跑（per-user 锁的存在意义就是防并发 resume 同一 session）；
+    - 不动 _sessions[user_id]——当前对话照旧续原会话，任务跑完也不切换；
+    - 落到的新会话记进 job["session"]，/use <job_id> 可继续它。
+    完成回调 on_done(result_text)（工作线程内执行）。返回 job_id；
+    并行数达上限返回 None。
+    """
+    running = [j for j in list_jobs(user_id)
+               if j.get("status") == "running" and j.get("kind") == "fresh"]
+    if len(running) >= _MAX_FRESH_PER_USER:
+        return None
+    job_id = uuid.uuid4().hex[:8]
+    with _jobs_guard:
+        _jobs[job_id] = {
+            "id": job_id,
+            "user_id": user_id,
+            "status": "running",
+            "started": time.time(),
+            "snippet": text[:40],
+            "session": None,          # 全新会话，跑完才落定
+            "kind": "fresh",
+        }
+
+    def _worker():
+        result, sid = "", None
+        try:
+            result, sid = _run_turn_sync(text, user_id, isolated=True)
+        except Exception as e:
+            result = f"⚠️ 新会话作业异常：{e}"
+        finally:
+            with _jobs_guard:
+                if job_id in _jobs:
+                    _jobs[job_id].update(status="done", finished=time.time(),
+                                         session=sid)
+            try:
+                on_done(result)
+            except Exception as e:
+                print(f"[fresh {job_id}] on_done 回调失败：{e}")
+
+    threading.Thread(target=_worker, daemon=True, name=f"fresh-{job_id}").start()
+    return job_id
+
+
 def ask_claude(text: str, user_id: str = "default") -> str:
     """阻塞式跑一轮（自测/兼容用）。main.py 请用 try_run_inline / submit_background。"""
     lk = _user_lock(user_id)
     lk.acquire()  # 阻塞等待该用户的锁
     try:
-        return _run_turn_sync(text, user_id)
+        return _run_turn_sync(text, user_id)[0]
     finally:
         lk.release()
 
@@ -441,8 +495,12 @@ def _cmd_procs(user_id: str) -> str:
         sid = j.get("session")
         if sid:
             sids.append(sid)
+        if j.get("kind") == "fresh":
+            tag = "🆕全新会话" + (f"→{sid[:8]}" if sid else "")
+        else:
+            tag = "续" + (f"会话 {sid[:8]}" if sid else "新会话")
         jlines.append(f"• job={j['id']} · {_age(j['started'] * 1000)}开始 · "
-                      f"续{'会话 ' + sid[:8] if sid else '新会话'} · {j.get('snippet', '')}")
+                      f"{tag} · {j.get('snippet', '')}")
     if jlines:
         lines.append("后台作业：")
         lines.extend(jlines)
@@ -492,7 +550,8 @@ _HELP = """📖 Bot 指令（均以 / 开头）
 • /exit — 退出当前会话（保留，可 /use 找回）
 • /del <序号|id> — 删除某会话（不可恢复）
 • /procs — claude 子进程与后台作业
-• /bg <任务> — 后台跑长任务（完成推回）
+• /new <任务> — 另起全新会话后台跑（不带当前对话历史，完成通知，可同时跑 2 个）
+• /bg <任务> — 后台跑长任务（续当前会话，完成推回）
 • /jobs — 后台作业状态
 • /reset — 同 /exit（清空当前对话）"""
 

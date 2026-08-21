@@ -15,6 +15,7 @@ from claude import (
     list_jobs,
     reset_user,
     submit_background,
+    submit_fresh,
     try_run_inline,
 )
 from ilink import ILinkClient
@@ -207,6 +208,29 @@ def main() -> None:
                         client.send_message(user_id, context_token,
                                             f"🚀 已派后台 job={job_id}，跑完发回这里。\n任务：{task[:80]}")
                         print(f"{_ts()} 🚀 -> [{user_id}] 后台 job={job_id}：{task[:60]}")
+
+                # /new <任务>：另起【全新会话】的后台子进程跑（不 resume 历史、
+                # 不占当前会话、可与当前对话并行），完成推回；/use <job_id> 可续它
+                elif stripped == "/new" or stripped.startswith("/new "):
+                    task = stripped[4:].strip()
+                    if not task:
+                        client.send_message(user_id, context_token,
+                                            "用法：/new <要办的事>——另起全新会话后台跑，"
+                                            "不带当前对话历史，完成发回这里。")
+                        continue
+                    job_id = submit_fresh(
+                        task, user_id,
+                        on_done=lambda r, uid=user_id: push_back(
+                            client, uid, f"✅ 新会话任务完成：\n{r}"),
+                    )
+                    if job_id is None:
+                        client.send_message(user_id, context_token,
+                                            "⏳ 你同时跑的新会话任务已到上限（2 个），等一个完成再发（/jobs 看状态）。")
+                    else:
+                        client.send_message(user_id, context_token,
+                                            f"🆕 已新起子进程 job={job_id}（全新会话、不带历史、"
+                                            f"不影响当前对话），跑完发回这里。\n任务：{task[:80]}")
+                        print(f"{_ts()} 🆕 -> [{user_id}] 全新会话 job={job_id}：{task[:60]}")
 
                 else:
                     est = estimate_seconds(text)
