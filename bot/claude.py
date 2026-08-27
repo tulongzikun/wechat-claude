@@ -43,6 +43,10 @@ MAX_TURNS = int(os.environ.get("WECHAT_AGENT_MAX_TURNS", "12"))
 # 180 是给多步探索任务（查会话/读多文件/分析）留余量——实测这类任务常跑到 120s+；
 # 普通对话 ~9s、单步工具 ~15-30s，远不会触顶。
 TURN_TIMEOUT = int(os.environ.get("WECHAT_AGENT_TIMEOUT", "180"))
+# 后台作业（/bg、/new）单轮超时（秒）：后台不占消息循环，给重任务更宽的窗口。
+# （2026-08-21 修复：此前后台与前台共用 TURN_TIMEOUT，/new 跑长任务 180s 被掐断，
+#  还回推"建议用 /new"这种自相矛盾的提示。）
+BG_TURN_TIMEOUT = int(os.environ.get("WECHAT_AGENT_BG_TIMEOUT", "900"))
 # 回复最长字符（微信长文体验差，超出截断）
 MAX_REPLY_LEN = 2000
 
@@ -176,22 +180,30 @@ async def _agent_turn(
     return answer or "（agent 这一轮没有返回文本）", new_sid
 
 
-def _run_turn_sync(text: str, user_id: str, isolated: bool = False) -> tuple[str, str | None]:
+def _run_turn_sync(text: str, user_id: str, isolated: bool = False,
+                   timeout: int | None = TURN_TIMEOUT) -> tuple[str, str | None]:
     """跑一轮 agent（含超时），返回 (回复文本, 本轮落到的 session_id)。
 
     调用方一般应已持有该 user 的锁——保证同一 session 不会被并发 resume。
     每次新建临时 event loop 驱动 agent（可安全用于主线程外的后台线程）。
     isolated=True：不读也不写该用户的会话指针——起全新会话跑一次性任务，
     与该用户正在续的其他会话互不冲突（transcript 不同，可并行）。
+    timeout：单轮限时（秒）；None 不限时。前台默认 TURN_TIMEOUT，/bg 与
+    /new 后台作业传 BG_TURN_TIMEOUT（更宽）——别改回全局共用一个值。
     """
     sid = None if isolated else _sessions.get(user_id)
     try:
-        answer, new_sid = asyncio.run(
-            asyncio.wait_for(_agent_turn(text, sid, user_id), timeout=TURN_TIMEOUT)
-        )
+        coro = _agent_turn(text, sid, user_id)
+        if timeout is None:
+            answer, new_sid = asyncio.run(coro)
+        else:
+            answer, new_sid = asyncio.run(asyncio.wait_for(coro, timeout=timeout))
     except asyncio.TimeoutError:
-        return (f"⏳ 处理超时（>{TURN_TIMEOUT}s）。"
-                f"这类长任务建议用 /bg 或 /new 跑后台，不卡循环、不撞超时。", sid)
+        if timeout == TURN_TIMEOUT:   # 前台：后台窗口更宽，提示转后台
+            tip = "长任务建议用 /bg 或 /new 跑后台（后台限时更长）。"
+        else:                         # 后台：已是最宽窗口，提示拆任务
+            tip = "任务过重，建议拆小分步发。"
+        return f"⏳ 处理超时（>{timeout}s）。{tip}", sid
     except Exception as e:
         return f"⚠️ agent 出错：{e}", sid
     if new_sid and not isolated:
@@ -217,7 +229,8 @@ def try_run_inline(text: str, user_id: str = "default") -> str | None:
 def submit_background(text: str, user_id: str, on_done) -> str | None:
     """派一个后台作业跑 agent，完成时在工作线程里回调 on_done(result_text)。
 
-    主循环立即返回，不阻塞、不受 TURN_TIMEOUT 限制。返回 job_id；
+    主循环立即返回，不阻塞；单轮限时用 BG_TURN_TIMEOUT（默认 900s，比前台
+    TURN_TIMEOUT 宽）。返回 job_id；
     若该用户已有任务在跑（锁被占），返回 None（调用方提示忙）。
     on_done 在工作线程内执行，应只做"发回微信"这类线程安全的事。
     """
@@ -240,7 +253,7 @@ def submit_background(text: str, user_id: str, on_done) -> str | None:
     def _worker():
         result, sid = "", None
         try:
-            result, sid = _run_turn_sync(text, user_id)
+            result, sid = _run_turn_sync(text, user_id, timeout=BG_TURN_TIMEOUT)
         except Exception as e:  # _run_turn_sync 已兜底，这里是双保险
             result = f"⚠️ 后台作业异常：{e}"
         finally:
@@ -294,7 +307,8 @@ def submit_fresh(text: str, user_id: str, on_done) -> str | None:
     def _worker():
         result, sid = "", None
         try:
-            result, sid = _run_turn_sync(text, user_id, isolated=True)
+            result, sid = _run_turn_sync(text, user_id, isolated=True,
+                                          timeout=BG_TURN_TIMEOUT)
         except Exception as e:
             result = f"⚠️ 新会话作业异常：{e}"
         finally:
