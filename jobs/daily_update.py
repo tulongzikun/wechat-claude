@@ -219,12 +219,37 @@ def summarize(updates: list[dict], since: str) -> str | None:
 
     from anthropic import Anthropic  # 延迟 import：顶部不加载重模块
     client = Anthropic()  # 自动用 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL
-    r = client.messages.create(
-        model=MODEL, max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
-    return text or None
+    # 网关偶发返回空文本/抛异常（2026-08-27 17:00 实测空文本被当成"无提交"谎报过）。
+    # 重试一次；仍拿不到就返回 None，由 main 走确定性兜底——绝不因此谎报"无更新"。
+    for attempt in (1, 2):
+        try:
+            # thinking=disabled：glm-5.3 等推理模型默认先出 thinking 块，会把
+            # max_tokens 预算耗光（stop=max_tokens 且 0 个 text 块——08-27 17:00
+            # 谎报"无提交"的根因）。摘要任务不需要思考，直接关掉。
+            r = client.messages.create(
+                model=MODEL, max_tokens=2000,
+                thinking={"type": "disabled"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(b.text for b in r.content
+                           if getattr(b, "type", None) == "text").strip()
+            if text:
+                return text
+            log(f"  ⚠️ 摘要 LLM 返回空文本（第 {attempt} 次，stop={r.stop_reason}）")
+        except Exception as e:
+            log(f"  ⚠️ 摘要 LLM 调用失败（第 {attempt} 次）："
+                f"{type(e).__name__} {str(e)[:120]}")
+    return None
+
+
+def _plain_digest(updates: list[dict]) -> str:
+    """LLM 摘要不可用时的确定性兜底：各仓提交标题平铺（超长由 fit_bytes 整行截）。"""
+    lines = []
+    for u in updates:
+        cs = "；".join(c for c in u["commits"][:6])
+        more = f"…（共 {u['count']} 条）" if u["count"] > 6 else ""
+        lines.append(f"• {u['name']}({u['branch']})：{cs}{more}")
+    return "\n".join(lines)
 
 
 # ---------- 推送 ----------
@@ -435,9 +460,7 @@ def main() -> None:
     tz_name = os.environ.get("TZ", "(未设TZ)")
     log(f"报告窗口起点：{since}（{tz_name} 昨日17:00）")
     updates = collect_updates(since)
-    summary = summarize(updates, since)
-
-    if summary is None:
+    if not updates:
         msg = (f"📭 {time.strftime('%m-%d')} 自昨日17:00起，"
                f"~/workspace 各项目 mainline 无新提交。")
         log("无更新。")
@@ -446,6 +469,13 @@ def main() -> None:
             return
         push(msg, hook_env="WECOM_WEBHOOK_DAILY")
         return
+
+    summary = summarize(updates, since)
+    if summary is None:
+        # LLM 空输出 ≠ 无提交（08-27 17:00 曾因此谎报过"无新提交"）：退化为确定性列表
+        log("  ⚠️ AI 摘要两试均空，退化为原始提交列表推送")
+        summary = ("⚠️ AI 摘要生成失败（网关异常），原始提交列表：\n"
+                   + _plain_digest(updates))
 
     total = sum(u["count"] for u in updates)
     header = (f"📢 项目每日更新（{time.strftime('%m-%d')}）\n"
