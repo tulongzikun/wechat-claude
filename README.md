@@ -34,7 +34,7 @@ wechat/
 ├── jobs/              # 定时任务层（cron 调用，主动推送）
 │   ├── run.sh         #   统一入口：环境装载 + 时区，跑 jobs/<任务名>.py
 │   ├── tasks.conf     #   任务注册表：任务名 | cron | 专属 webhook 变量 | 说明
-│   ├── daily_update.py    # 每天 17:00：workspace 各仓 mainline 提交摘要
+│   ├── daily_update.py    # 每天 17:00：GHE 各 org 全部仓库 mainline 提交摘要（API 取数，名单落 repository.txt）
 │   ├── weekly_papers.py   # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
 │   ├── games_news.py      # 每周二 10:00：米哈游游戏资讯（更新/未实装情报/联动）
 │   ├── macro_weekly.py    # 每周四 10:00：宏观周报（中美基本面/市场行业/国际局势/前瞻）

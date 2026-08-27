@@ -84,11 +84,15 @@ else
 fi
 echo
 
-echo "══ daily_update 仓库过滤 ══"
-if [ -n "${DAILY_REPO_FILTER:-}" ]; then
-    echo "  DAILY_REPO_FILTER = $DAILY_REPO_FILTER（origin 含此子串的仓库才汇总）"
+echo "══ daily_update 仓库监控（GHE API）══"
+if [ -n "${GHE_API:-}" ] && [ -n "${GHE_ORGS:-}" ]; then
+    echo "  GHE_API  = $GHE_API"
+    echo "  GHE_ORGS = $GHE_ORGS（org 名下全部仓库；名单落 jobs/repository.txt）"
 else
-    echo "  DAILY_REPO_FILTER 未设 = ~/workspace 全部仓库"
+    echo "  ⚠️ GHE_API / GHE_ORGS 未配，daily_update 会直接报错退出"
+fi
+if [ -f "$(dirname "$0")/repository.txt" ]; then
+    echo "  repository.txt 现有 $(wc -l < "$(dirname "$0")/repository.txt") 个仓库"
 fi
 echo
 

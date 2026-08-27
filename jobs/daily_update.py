@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""每日拉取 ~/workspace 下所有项目的 mainline 更新 → Claude 总结 → 主动推送微信。
+"""每日监控 GHE 组织下所有仓库的 mainline 更新 → Claude 总结 → 主动推送微信。
 
 由 cron 每日 17:00 触发（run.sh daily_update + crontab）。
 
 设计要点：
-- 只 `git fetch`，**不 merge / 不 checkout**，绝不碰工作区。
+- **数据源是 GitHub Enterprise API，不是本地 workspace**——监控范围 = GHE_ORGS
+  里各组织名下的全部仓库（含本地没 clone 的），每天先刷新 org 仓库清单落盘到
+  jobs/repository.txt（副产物：既是人可读的监控名单，也是 API 不可用时的回退源），
+  再逐仓查 default branch 在窗口内的提交。零本地 clone、零 git 依赖。
 - **窗口语义**：每次报告【昨日 17:00 之后落到 mainline 的所有 commit】（按 committer
-  date），不依赖 fetch 时机 / 手动重跑——即便某 commit 之前已被 fetch、也已出现在
-  origin/master，只要其提交时间在窗口内就照常总结。这是确定的日历窗口，无状态。
-- 每个仓库按 mainline 分支（origin/master → main，**不看 origin/HEAD**）。
+  date），确定的日历窗口、无状态——commits API 的 since 过滤与原 git log --since 同义
+  （已实测两边逐条一致）。
+- **鉴权**：GHE_API（如 https://<内网域名>/api/v3）+ GHE_AUTH（user:password，Basic），
+  都放 .env（域名/凭证敏感不入库）；GHE_AUTH 未设时自动从 ~/.git-credentials 里
+  找该 host 的凭证（bot 与 cron 同一 OS 用户，等价可用）。
 - 用 anthropic SDK 总结（自动走 ANTHROPIC_BASE_URL 网关 + ANTHROPIC_AUTH_TOKEN，
   模型用 HAIKU，便宜够用）。
 - 推送走 ilink.ILinkClient + token.json；收件人 = WECHAT_ADMIN_USERS，
@@ -16,28 +21,29 @@
 - 目录分层：本文件在 jobs/（定时任务），微信通讯层在 ../bot/
   （token.json / latest_ctx.json / ilink.py 都在那边）。
 
-调试：python3 daily_update.py --dry-run   只 fetch+总结+打印，不推送。
+调试：python3 daily_update.py --dry-run   只拉取+总结+打印，不推送。
 """
 
+import base64
 import datetime
 import json
 import os
 import re
-import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 DIR = Path(__file__).resolve().parent          # jobs/（定时任务层）
 BOT_DIR = DIR.parent / "bot"                   # bot/（微信通讯层，token / latest_ctx 在这里）
-WORKSPACE = Path.home() / "workspace"
 LATEST_CTX_FILE = BOT_DIR / "latest_ctx.json"  # {user_id: context_token}（bot 落盘）
 TOKEN_FILE = BOT_DIR / "token.json"
+REPO_LIST_FILE = DIR / "repository.txt"        # 监控名单副产物（gitignore，不入库）
 
 # ilink 客户端在 bot/ 下，push 回退要用（sys.path 是给延迟 import `from ilink import ...` 的）
 sys.path.insert(0, str(BOT_DIR))
 
-FETCH_TIMEOUT = 60            # 单仓库 fetch 超时
+API_TIMEOUT = 20              # 单次 GHE API 超时（秒）
 MAX_COMMITS_PER_REPO = 30     # 每仓库喂给模型的提交上限（防超长）
 MAX_REPLY_LEN = 1800          # 字符上限（体验约束，次级）
 MAX_REPLY_BYTES = 3600        # 字节上限（硬约束）：企微 markdown 限 4096 字节，
@@ -81,7 +87,7 @@ def since_yesterday_5pm() -> str:
     """报告时区的昨日 17:00（窗口起点）。
 
     时区由进程 TZ 决定（= cron 的 CRON_TZ，默认 Asia/Shanghai），与 cron 触发点对齐
-    成完整 24h。返回 naive 时间串，`git log --since` 按进程 TZ 解释——所以不写死
+    成完整 24h。返回 naive 时间串，to_utc_iso() 再转成 API 要的 UTC——所以不写死
     offset、不依赖具体地区，换时区零改动。
     """
     now = datetime.datetime.now()  # naive，按 TZ env（= CRON_TZ）
@@ -90,74 +96,160 @@ def since_yesterday_5pm() -> str:
     return y.strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ---------- git ----------
+def to_utc_iso(local_naive: str) -> str:
+    """naive 本地时间串（按进程 TZ 解释）→ UTC ISO8601（commits API 的 since 参数）。
 
-def git(repo: Path, *args: str) -> tuple[int, str]:
-    """跑 git，返回 (rc, stdout)。超时/异常不抛，由调用方判断。"""
-    try:
-        r = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True, text=True, timeout=FETCH_TIMEOUT,
-        )
-        return r.returncode, r.stdout.strip()
-    except Exception as e:
-        return 1, f"<git error: {e}>"
-
-
-def default_branch(repo: Path) -> str | None:
-    """该仓库的 mainline 分支：origin/master → origin/main（取存在的第一个），都没有返回 None。
-
-    故意不看 origin/HEAD——它是「当前 checkout 的远程默认分支」，某些仓会指向 docs/
-    feature 分支（如 notes 指向 docs/ic-daily-global），那样会漏掉真正主线上的提交。
-    统一以 origin/master（兜底 main）为每个仓的主线。
+    commits API 的 since/分页里的时间都是 UTC；本地窗口串按 TZ env 解释成 epoch
+    再 gmtime 输出，与 git log --since（本地 TZ 解释）完全同窗。
     """
-    for b in ("master", "main"):
-        rc, _ = git(repo, "rev-parse", "--verify", f"origin/{b}")
-        if rc == 0:
-            return b
+    st = time.strptime(local_naive, "%Y-%m-%d %H:%M:%S")
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.mktime(st)))
+
+
+# ---------- GHE API ----------
+
+# API 基址与组织列表放 .env（内网域名敏感不入库）；未配置时明确报错而不是静默空跑。
+GHE_API = os.environ.get("GHE_API", "").rstrip("/")
+GHE_ORGS = [o.strip() for o in os.environ.get("GHE_ORGS", "").split(",") if o.strip()]
+
+
+def _ghe_auth() -> str | None:
+    """GHE API 的 Authorization 头（Basic）。
+
+    优先 .env 的 GHE_AUTH="user:password"；未设则从 ~/.git-credentials 里找
+    GHE_API 对应 host 的凭证（本任务与 git 同一 OS 用户，凭证同源；密码含特殊
+    字符时 credential store 已按 percent-encoding 存，解开即原值）。
+    """
+    explicit = os.environ.get("GHE_AUTH", "").strip()
+    if explicit:
+        return "Basic " + base64.b64encode(explicit.encode()).decode()
+    cred_file = Path.home() / ".git-credentials"
+    try:
+        host = urllib.parse.urlparse(GHE_API).hostname
+        for line in cred_file.read_text().splitlines():
+            u = urllib.parse.urlparse(line.strip())
+            if u.hostname == host and u.username and u.password:
+                pw = urllib.parse.unquote(u.password)
+                return "Basic " + base64.b64encode(f"{u.username}:{pw}".encode()).decode()
+    except OSError:
+        pass
     return None
 
 
-def repo_filter() -> str:
-    """仓库过滤子串：origin remote URL 里必须包含（如内网 git 域名）。空 = 不过滤。
+def ghe_get(path: str, **params) -> list | dict | None:
+    """GET {GHE_API}{path}?params，返回解析后的 json；失败（网络/40x）返回 None。"""
+    import requests  # 延迟 import
+    try:
+        r = requests.get(f"{GHE_API}{path}", params=params, timeout=API_TIMEOUT,
+                         headers={"Authorization": _ghe_auth() or "",
+                                  "User-Agent": "daily-update"},)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log(f"  ⚠️ GHE API {path} 失败：{type(e).__name__} {str(e)[:100]}")
+        return None
 
-    配置在 .env 的 DAILY_REPO_FILTER，按需启用——比如只想汇总内网仓库
-    （git 内网域名）时设为该域名，个人/开源仓自动排除。域名本身视为敏感信息，
-    只放 .env（gitignore），代码里用占位示例。
+
+def list_org_repos(org: str) -> list[dict] | None:
+    """某组织名下全部仓库（分页拉全）。首页就失败返回 None（区别于真的 0 仓）。"""
+    repos, page = [], 1
+    while True:
+        batch = ghe_get(f"/orgs/{org}/repos", per_page=100, page=page, type="all")
+        if batch is None:
+            return None if page == 1 else repos  # 翻页挂：用已拉到的部分
+        repos += batch
+        if len(batch) < 100:
+            return repos
+        page += 1
+
+
+def _read_repo_list_file() -> list[dict]:
+    """把落盘名单读回监控条目（pushed_at 未知 → None，collect 时不跳过）。"""
+    if not REPO_LIST_FILE.exists():
+        return []
+    out = []
+    for l in REPO_LIST_FILE.read_text(encoding="utf-8").splitlines():
+        p = l.split()
+        if p:
+            out.append({"full_name": p[0],
+                        "default_branch": p[1] if len(p) > 1 else "master",
+                        "pushed_at": None})
+    return out
+
+
+def refresh_repo_list() -> list[dict]:
+    """刷新监控名单：GHE_ORGS 各 org 的仓库全量 → 落盘 repository.txt，返回列表。
+
+    每行 "owner/repo default分支"（人可读、也是 API 挂掉时的回退源）。某个 org
+    拉取失败时从旧名单补上该 org 的条目（别让一次抖动把半个名单冲掉）；全部失败
+    且没有旧名单可回退时直接抛错——宁可不推也不能装作"无提交"（同 08-27 谎报原则）。
     """
-    return os.environ.get("DAILY_REPO_FILTER", "").strip()
+    if not GHE_API or not GHE_ORGS:
+        raise RuntimeError("GHE_API / GHE_ORGS 未配置（应在 .env 里）")
+    fresh, failed_orgs = [], []
+    for org in GHE_ORGS:
+        got = list_org_repos(org)
+        if got is None:
+            failed_orgs.append(org)
+        else:
+            fresh += got
+    stale = _read_repo_list_file()
+    if failed_orgs:
+        # 失败 org 的旧条目顶上（没有旧的就认缺失，log 里说清楚）
+        keep = [s for s in stale if s["full_name"].split("/")[0] in failed_orgs]
+        if keep:
+            log(f"  ⚠️ org {','.join(failed_orgs)} 列表拉取失败，"
+                f"沿用旧名单 {len(keep)} 个条目")
+        else:
+            log(f"  ⚠️ org {','.join(failed_orgs)} 列表拉取失败且无旧条目可补")
+        fresh += keep
+    if not fresh:
+        if stale:
+            log(f"  ⚠️ 全部 org 列表拉取失败，回退 {REPO_LIST_FILE.name}"
+                f"（{len(stale)} 个，可能不含最新建仓）")
+            return stale
+        raise RuntimeError("org 仓库列表拉取失败，且无 repository.txt 可回退")
+    fresh.sort(key=lambda r: r["full_name"])
+    lines = [f"{r['full_name']} {r.get('default_branch') or 'master'}" for r in fresh]
+    REPO_LIST_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log(f"监控名单：{len(fresh)} 个仓库（{', '.join(GHE_ORGS)}）→ {REPO_LIST_FILE.name}")
+    return fresh
 
 
 def collect_updates(since: str) -> list[dict]:
-    """遍历所有仓库，返回窗口内有提交的仓库列表。
+    """遍历监控名单里的所有仓库，返回窗口内有提交的仓库列表。
 
-    窗口 = since 之后、按 committer date 落到 mainline 的 commit。无状态、可重复：
-    每次跑都报同一个日历窗口，不受 fetch 时机或之前是否已 fetch 影响。
+    窗口 = since（本地 naive 串）之后、按 committer date 落到 default 分支的 commit。
+    无状态、可重复：每次跑都报同一个日历窗口。commits API 的 since 与 git log
+    --since 同义（committer date、按 UTC 比较），已实测与本地 git log 逐条一致。
+
+    防谎报（同 08-27 原则）：任一仓库查询失败会记数；若最终一个更新都没收集到
+    但存在失败，直接抛错让 cron 日志留痕——绝不把"查不到"包装成"无提交"。
     """
-    repos = sorted(p for p in WORKSPACE.iterdir() if (p / ".git").is_dir())
-    flt = repo_filter()
-    if flt:
-        log(f"仓库过滤：origin 含「{flt}」")
-    updates = []
-    for repo in repos:
-        name = repo.name
-        if flt:
-            _, url = git(repo, "remote", "get-url", "origin")
-            if flt not in url:
-                log(f"  ⊘ {name}: origin 非目标域，跳过")
-                continue
-        rc, _ = git(repo, "fetch", "--quiet", "origin")
-        if rc != 0:
-            log(f"  ⚠️ {name}: fetch 失败，沿用本地 origin 引用")
-
-        branch = default_branch(repo)
-        if not branch:
-            log(f"  ⊘ {name}: 无 origin/master|main，跳过")
+    since_utc = to_utc_iso(since)
+    updates, failed = [], 0
+    for r in refresh_repo_list():
+        name, branch = r["full_name"], r.get("default_branch") or "master"
+        # pushed_at 预筛：全仓最后一次 push 都早于窗口起点 ⇒ 任何分支都不可能有
+        # 窗口内提交，省一次 commits 调用（回退名单无此信息时不跳）
+        pushed = r.get("pushed_at")
+        if pushed and pushed < since_utc:
+            log(f"  • {name}: 窗口内无提交")
             continue
-
-        _, body = git(repo, "log", f"--since={since}", "--format=%h %s",
-                      f"origin/{branch}")
-        commits = [l for l in body.splitlines() if l.strip()]
+        d = ghe_get(f"/repos/{name}/commits", sha=branch, since=since_utc,
+                    per_page=100)
+        if d is None:
+            # 回退名单的分支信息可能过期（404），换另一个主线名再试一次
+            alt = "main" if branch == "master" else "master"
+            d = ghe_get(f"/repos/{name}/commits", sha=alt, since=since_utc,
+                        per_page=100)
+            if d is not None:
+                branch = alt
+        if d is None:
+            failed += 1
+            continue
+        commits = [f"{c['sha'][:8]} {c['commit']['message'].splitlines()[0]}".rstrip()
+                   for c in d if isinstance(c, dict)]
         if not commits:
             log(f"  • {name}: 窗口内无提交")
             continue
@@ -170,6 +262,8 @@ def collect_updates(since: str) -> list[dict]:
         })
         tail = "（截断）" if len(commits) > len(capped) else ""
         log(f"  ▲ {name}({branch}): 窗口内 {len(commits)} 条{tail}")
+    if not updates and failed:
+        raise RuntimeError(f"{failed} 个仓库提交查询失败且无任何收集结果，疑似 API/鉴权故障")
     return updates
 
 

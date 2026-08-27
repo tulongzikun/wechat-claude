@@ -12,6 +12,9 @@ latest_ctx.json
 # 历史增量 SHA（已改成无状态时间窗口，弃用，保险忽略）
 update_state.json
 
+# daily_update 监控名单副产物（内网仓库名，不入库）
+jobs/repository.txt
+
 # 所有日志（含 cron 的 daily_update.log）
 *.log
 
