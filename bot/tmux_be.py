@@ -26,6 +26,10 @@ import time
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 常驻会话当前 --resume 的会话 id(/use 切换时更新;None=全新会话)。
+# /del 删会话前查它,防止删掉正被常驻会话续着的 transcript。
+_resume_sid: str | None = None
+
 # tmux 会话名 / agent 工作区(与 SDK 后端 AGENT_CWD 对齐,可环境变量覆盖)
 SESSION = os.environ.get("WECHAT_TMUX_SESSION", "wxclaude")
 CWD = os.environ.get("WECHAT_AGENT_CWD", "/home/zhouzikun")
@@ -53,8 +57,11 @@ def _pane_dead() -> bool:
     return r.stdout.strip().splitlines()[:1] == ["1"]
 
 
-def ensure_session() -> str:
-    """确保 tmux 会话活着并跑着 claude。返回 "ok" / "restarted" / 失败原因。"""
+def ensure_session(resume_sid: str | None = None) -> str:
+    """确保 tmux 会话活着并跑着 claude。返回 "ok" / "restarted" / 失败原因。
+
+    resume_sid:给 claude 加 --resume <sid>,续跑某个历史会话的上下文
+    (/use 切换用);已重建过的会话不会重复 resume。"""
     if has_session() and not _pane_dead():
         return "ok"
     if has_session():                       # pane 死了:留尸可查,这里整个重建
@@ -73,12 +80,49 @@ def ensure_session() -> str:
     env_cmd = " ".join(f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in passthrough.items())
     cmd = (f"{env_cmd} exec {shlex.quote(claude)} "
            f"--settings {shlex.quote(SETTINGS_FILE)} --permission-mode acceptEdits")
+    if resume_sid:
+        cmd += f" --resume {shlex.quote(resume_sid)}"
     r = _run(["new-session", "-d", "-s", SESSION, "-x", "200", "-y", "50",
               "-c", CWD, cmd])
     if r.returncode != 0:
         return f"tmux new-session 失败:{r.stderr.strip()}"
     _run(["set-option", "-t", SESSION, "remain-on-exit", "on"])
+    global _resume_sid
+    _resume_sid = resume_sid
+    _dismiss_trust_dialog()
     return "restarted"
+
+
+def _dismiss_trust_dialog(timeout: float = 8.0) -> None:
+    """重建后若弹出 workspace trust 确认,替用户按下 Enter(选中的就是 1.Yes)。
+
+    背景:全新/带 --resume 的重建都会再弹一次 trust——多 claude 实例共写
+    ~/.claude.json,确认状态不持久。不处理的话第一条消息会被弹窗吃掉。
+    按键确认与管理员触发的会话创建同源(非 admin 消息根本进不了会话)。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(1)
+        cap = _run(["capture-pane", "-t", SESSION, "-p", "-S", "-20"]).stdout
+        if "trust this folder" in cap:
+            _run(["send-keys", "-t", SESSION, "Enter"])
+            time.sleep(1)
+            return
+        if "Quick safety check" not in cap:   # 没在弹窗,已是正常 TUI
+            return
+
+
+def resuming_sid() -> str | None:
+    """常驻会话当前续着的会话 id(None=全新会话)。/del 删除前查。"""
+    return _resume_sid
+
+
+def switch_session(sid: str) -> str | None:
+    """结束当前常驻会话,以 --resume <sid> 重建(续某历史会话的上下文)。
+    成功返回 None,失败返回原因。"""
+    kill_session()
+    r = ensure_session(resume_sid=sid)
+    return None if r in ("ok", "restarted") else r
 
 
 def kill_session() -> None:

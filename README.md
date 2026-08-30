@@ -1,21 +1,24 @@
 # iLink + Claude 微信 Bot
 
-把微信消息经 iLink（微信 ClawBot）协议接进来，交给一个**常驻 Claude agent**
-（[Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)）处理，
-再原路发回。agent 自带工具——能跑命令、读写文件、联网搜索，且跨消息记得上文。
+把微信消息经 iLink（微信 ClawBot）协议接进来，交给一个**常驻在 tmux 里的
+交互式 Claude Code 会话**处理，跑完一轮由 Stop hook 推回。agent 自带工具——
+能跑命令、读写文件、联网搜索，且跨消息记得上文、免单轮超时。
 
 ```
 微信用户发消息
      │
      ▼
- iLink 长轮询 getupdates  ──►  main.py
-                                   │
-                            Claude Agent SDK（每用户一个常驻 agent 会话）
+ iLink 长轮询 getupdates  ──►  main.py ──► tmux send-keys（注入即返回）
+                                          │
+                                          ▼
+                            tmux 会话 wxclaude（交互式 claude 常驻）
                             ├─ Bash / Read / Edit / Write
                             ├─ Glob / Grep
                             └─ WebSearch / WebFetch
-                                   │
- iLink sendmessage  ◄──────────────┘  （每条带唯一 client_id + 原路 context_token）
+                                          │
+                              Stop hook（tmux_hook.py，回合结束触发）
+                                          │
+ iLink sendmessage  ◄─────────────────────┘  （每条带唯一 client_id + 原路 context_token）
      │
      ▼
 微信用户收到回复
@@ -26,8 +29,8 @@
 ```
 wechat/
 ├── bot/               # 微信通讯层：iLink 收发 + Claude agent
-│   ├── main.py        #   主循环：iLink 收消息 → agent → 发回复
-│   ├── claude.py      #   Claude Agent SDK 后端（per-user agent 会话 + 工具分层）
+│   ├── main.py        #   主循环：iLink 收消息 → tmux 常驻会话（唯一对话路径）
+│   ├── claude.py      #   会话监控层（/sessions /tail /use /del /help）
 │   ├── tmux_be.py     #   tmux 常驻会话后端（免超时，见下方专节）
 │   ├── tmux_hook.py   #   Claude Code hook：Stop/Notification → 推回微信
 │   ├── tmux_settings.json # 常驻会话的 --settings（hooks + 权限白名单）
@@ -151,45 +154,44 @@ bash jobs/run.sh weekly_papers --dry-run
 | 指令 | 作用 |
 |---|---|
 | `/help` | 指令一览 |
-| `/bg <任务>` | 后台跑长任务（续当前会话，完成推回，不占主循环） |
-| `/new <任务>` | 另起**全新会话**后台跑（不 resume 历史、不影响当前对话，可并行 2 个，完成推回） |
-| `/jobs` | 看进行中的后台作业 |
-| `/reset` | 清空当前用户的对话，下条消息开新会话 |
-| `/sessions [N]` | 列出所有 Claude 会话（跨项目，按最近活动降序） |
+| `/reset` | 结束常驻会话，下条消息开新会话（历史保留可找回） |
+| `/sessions [N]` | 列出所有 Claude 会话（含常驻会话的历史，按最近活动降序） |
 | `/tail <序号\|id前缀> [N]` | 看某会话最近 N 条对话 |
-| `/use <序号\|id前缀\|job_id>` | 把当前对话切到指定会话/某后台作业的会话继续 |
-| `/exit` | 退出当前会话（transcript 保留，可 `/use` 找回） |
-| `/del <序号\|id前缀>` | 硬删某会话（不可恢复；删除当前会话时一并退出） |
-| `/procs` | bot 派生的 claude 子进程（PID、已跑时长、各自续的会话）+ 运行中作业 |
-| `/file <路径> [附言]` | 把服务器上的文件/图片/视频发到微信（仅管理员；AES-128-ECB 加密上传微信 CDN） |
-| `/t <消息>` | 发进 **tmux 常驻会话**（免超时，在跑会排队，回复由 hook 推送；仅管理员） |
-| `/screen` | 抓常驻会话当前画面（进度/排队/死因） |
+| `/use <序号\|id前缀>` | 常驻会话切到指定历史会话续跑（kill 后 `--resume` 重建） |
+| `/del <序号\|id前缀>` | 硬删某会话（不可恢复；正被常驻会话续着时拒绝） |
+| `/screen` | 常驻会话当前画面 + 状态（进度/排队/死因） |
 | `/esc` | 打断常驻会话当前任务（插队说新话） |
 | `/tap <键>` | 向常驻会话透传按键（权限确认选 `1`/`y`、`C-c` 等，tmux 键名） |
-| `/texit` | 结束常驻会话（历史 transcript 留盘，`/sessions` 可查） | |
+| `/file <路径> [附言]` | 把服务器上的文件/图片/视频发到微信（仅管理员；AES-128-ECB 加密上传微信 CDN） |
 
-普通文字一律当对话内容发给 agent，不作为指令触发。会话监控基于 Claude
-Agent SDK 的会话管理 API（`list_sessions` / `get_session_messages` /
-`delete_session` 等，读写 `~/.claude` 的 transcript）；子进程监控扫
-`/proc` 找 bot 的 claude 后代进程，从命令行的 `--resume=<id>` 关联到会话。
-bot 重启会丢内存里的会话指针——用 `/sessions` + `/use` 可找回任意历史会话继续。
+**普通消息直接进 tmux 常驻会话**（唯一对话路径，仅管理员）：注入即返回，
+空闲即答、在跑会排队（不丢），回复由 Stop hook 推回；未知 `/` 指令提示
+而不灌进会话。会话监控基于 Claude Agent SDK 的会话管理 API
+（`list_sessions` / `get_session_messages` / `delete_session`，读写
+`~/.claude` 的 transcript——tmux 会话的 transcript 同样可查、可 `/use` 续跑）。
 
 首次运行会生成二维码（`qr.png`），**在手机微信里**扫码登录（二维码页依赖
 WeixinJSBridge，普通浏览器打不开）。登录后 `token.json` 自动写入，下次复用免扫码。
 
-## tmux 常驻会话（免超时后端）
+## tmux 常驻会话（唯一对话后端）
 
-SDK 后端（`claude.py`）每条消息 spawn 新 claude 进程，两个老毛病：长任务撞
-单轮超时（超时即 cancel，结果全丢）、每次 `resume` 重放全量 transcript 既慢
-又费调用额度（易撞网关限频）。`/t` 系指令换执行面解决：
+原 SDK 后端每条消息 spawn 新 claude 进程，两个老毛病：长任务撞单轮超时
+（超时即 cancel，结果全丢）、每次 `resume` 重放全量 transcript 既慢又费调用
+额度（易撞网关限频）。2026-08-30 精简后 **tmux 常驻会话是唯一对话路径**
+（SDK 执行层 `/bg` `/new` `/jobs` 及内联 agent 退役，`claude.py` 只剩会话
+监控指令）：
 
 - **执行面**：一个交互式 claude 常驻在 tmux 会话 `wxclaude` 里，与 bot 进程
-  生命周期解耦（bot 重启不丢；claude 崩了 pane 留尸，`/screen` 查死因后
-  `/t` 自动重建）。没有等待窗口，任务想跑多久跑多久；prompt cache 常热；
-  单会话天然串行，消息排队不丢。
-- **消息流**：`/t` 注入文本（多行走 bracketed paste，瞬间返回不阻塞主循环）
-  → claude 跑完一轮 → Stop hook（`tmux_hook.py`，经 `--settings` 挂载）读
+  生命周期解耦（bot 重启不丢；claude 崩了 pane 留尸，`/screen` 查死因后自动
+  重建）。没有等待窗口，任务想跑多久跑多久；prompt cache 常热；单会话天然
+  串行，消息排队不丢。
+- **消息流**：普通消息注入即返回（多行走 bracketed paste，不阻塞主循环）→
+  claude 跑完一轮 → Stop hook（`tmux_hook.py`，经 `--settings` 挂载）读
   transcript 尾部推回微信；等权限确认时 Notification hook 推提醒，`/tap` 透传回应。
+- **会话切换**：`/use <ref>` 把常驻会话 kill 后以 `--resume <sid>` 重建，续跑
+  任意历史会话（含 tmux 自己的 transcript）；`/reset` 回到全新会话。重建后若弹
+  workspace trust 确认（多 claude 实例共写 `~/.claude.json`，状态不持久），
+  `ensure_session` 会自动替用户按下 Enter，别让第一条消息被弹窗吃掉。
 - **控制面解耦**：电脑上 `tmux attach -t wxclaude` 可全交互接管同一个会话，
   与微信看到的是同一个 claude。
 - 长任务正解是让 claude 用后台 Bash 跑（任务完成自动唤起它继续），对话不受影响；
@@ -197,7 +199,7 @@ SDK 后端（`claude.py`）每条消息 spawn 新 claude 进程，两个老毛�
 - 实测坑：**Stop hook 触发时本轮最终回复往往尚未写入 transcript**（读到的恒是
   上一轮的），hook 里以行号为锚轮询等新行出现（`_wait_for_new_text`），别改成
   只判文本非空。
-- 推送目标：`tmux_state.json`（`/t` 写入的绑定用户）+ `latest_ctx.json`（最近
+- 推送目标：`tmux_state.json`（普通消息写入的绑定用户）+ `latest_ctx.json`（最近
   context_token），与 jobs 外部推送同一套链路。hook 运行日志在 `bot/tmux_hook.log`。
 
 ## 协议要点（踩过的坑，详见代码注释）
