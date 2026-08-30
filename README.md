@@ -28,6 +28,9 @@ wechat/
 ├── bot/               # 微信通讯层：iLink 收发 + Claude agent
 │   ├── main.py        #   主循环：iLink 收消息 → agent → 发回复
 │   ├── claude.py      #   Claude Agent SDK 后端（per-user agent 会话 + 工具分层）
+│   ├── tmux_be.py     #   tmux 常驻会话后端（免超时，见下方专节）
+│   ├── tmux_hook.py   #   Claude Code hook：Stop/Notification → 推回微信
+│   ├── tmux_settings.json # 常驻会话的 --settings（hooks + 权限白名单）
 │   ├── ilink.py       #   iLink API 客户端（扫码 / 收消息 / 发消息）
 │   ├── login.py       #   扫码登录 + token 持久化
 │   └── start.sh / stop.sh   # 后台常驻启停
@@ -159,6 +162,11 @@ bash jobs/run.sh weekly_papers --dry-run
 | `/del <序号\|id前缀>` | 硬删某会话（不可恢复；删除当前会话时一并退出） |
 | `/procs` | bot 派生的 claude 子进程（PID、已跑时长、各自续的会话）+ 运行中作业 |
 | `/file <路径> [附言]` | 把服务器上的文件/图片/视频发到微信（仅管理员；AES-128-ECB 加密上传微信 CDN） |
+| `/t <消息>` | 发进 **tmux 常驻会话**（免超时，在跑会排队，回复由 hook 推送；仅管理员） |
+| `/screen` | 抓常驻会话当前画面（进度/排队/死因） |
+| `/esc` | 打断常驻会话当前任务（插队说新话） |
+| `/tap <键>` | 向常驻会话透传按键（权限确认选 `1`/`y`、`C-c` 等，tmux 键名） |
+| `/texit` | 结束常驻会话（历史 transcript 留盘，`/sessions` 可查） | |
 
 普通文字一律当对话内容发给 agent，不作为指令触发。会话监控基于 Claude
 Agent SDK 的会话管理 API（`list_sessions` / `get_session_messages` /
@@ -168,6 +176,29 @@ bot 重启会丢内存里的会话指针——用 `/sessions` + `/use` 可找回
 
 首次运行会生成二维码（`qr.png`），**在手机微信里**扫码登录（二维码页依赖
 WeixinJSBridge，普通浏览器打不开）。登录后 `token.json` 自动写入，下次复用免扫码。
+
+## tmux 常驻会话（免超时后端）
+
+SDK 后端（`claude.py`）每条消息 spawn 新 claude 进程，两个老毛病：长任务撞
+单轮超时（超时即 cancel，结果全丢）、每次 `resume` 重放全量 transcript 既慢
+又费调用额度（易撞网关限频）。`/t` 系指令换执行面解决：
+
+- **执行面**：一个交互式 claude 常驻在 tmux 会话 `wxclaude` 里，与 bot 进程
+  生命周期解耦（bot 重启不丢；claude 崩了 pane 留尸，`/screen` 查死因后
+  `/t` 自动重建）。没有等待窗口，任务想跑多久跑多久；prompt cache 常热；
+  单会话天然串行，消息排队不丢。
+- **消息流**：`/t` 注入文本（多行走 bracketed paste，瞬间返回不阻塞主循环）
+  → claude 跑完一轮 → Stop hook（`tmux_hook.py`，经 `--settings` 挂载）读
+  transcript 尾部推回微信；等权限确认时 Notification hook 推提醒，`/tap` 透传回应。
+- **控制面解耦**：电脑上 `tmux attach -t wxclaude` 可全交互接管同一个会话，
+  与微信看到的是同一个 claude。
+- 长任务正解是让 claude 用后台 Bash 跑（任务完成自动唤起它继续），对话不受影响；
+  `--settings` 里预批了常用只读 Bash 白名单，减少权限确认卡顿。
+- 实测坑：**Stop hook 触发时本轮最终回复往往尚未写入 transcript**（读到的恒是
+  上一轮的），hook 里以行号为锚轮询等新行出现（`_wait_for_new_text`），别改成
+  只判文本非空。
+- 推送目标：`tmux_state.json`（`/t` 写入的绑定用户）+ `latest_ctx.json`（最近
+  context_token），与 jobs 外部推送同一套链路。hook 运行日志在 `bot/tmux_hook.log`。
 
 ## 协议要点（踩过的坑，详见代码注释）
 

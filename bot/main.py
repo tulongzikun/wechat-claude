@@ -21,6 +21,7 @@ from claude import (
 )
 from ilink import ILinkClient
 from login import load_token, login
+import tmux_be
 
 
 def _ts() -> str:
@@ -181,9 +182,70 @@ def main() -> None:
                                             "没有正在跑的后台作业。")
 
                 # 会话/子进程监控：/sessions /tail /use /exit /del /procs /help
-                #（claude.py 实现，非监控指令返回 None 落到后面的正常分发）
+                #（claude.py 实现，非监控指令返回 None 落到下面的正常分发）
                 elif (mon := handle_monitor_command(stripped, user_id)) is not None:
                     client.send_message(user_id, context_token, mon)
+
+                # ---- tmux 常驻会话（免超时后端，机制见 tmux_be.py 顶部注释）----
+                # /t 把文本注入常驻的交互式 claude：瞬间返回不阻塞，claude 跑完
+                # 一轮由 Stop hook（tmux_hook.py）把结果推回微信。会话里的 claude
+                # 有 Bash 全工具，所以仅管理员可用。
+                elif stripped == "/t" or stripped.startswith("/t "):
+                    task = stripped[2:].strip()
+                    if ADMIN_USERS and user_id not in ADMIN_USERS:
+                        client.send_message(user_id, context_token,
+                                            "⚠️ /t 仅管理员可用（常驻会话有 Bash 全工具）。")
+                    elif not task:
+                        client.send_message(user_id, context_token,
+                                            f"{tmux_be.status()}\n"
+                                            "用法：/t <要说的话> 发进常驻会话（空闲即答，"
+                                            "在跑会排队）；/screen 看画面；/esc 打断；"
+                                            "/tap <键> 回应权限确认；/texit 结束会话。")
+                    else:
+                        tmux_be.bind_user(user_id)
+                        r = tmux_be.ensure_session()
+                        if r in ("ok", "restarted"):
+                            tmux_be.send_text(task)
+                            client.send_message(user_id, context_token,
+                                                "📨 已送入常驻会话（空闲即答；在跑会排队），"
+                                                "回复由 hook 推送。")
+                            print(f"{_ts()} 📨 -> [{user_id}] "
+                                  f"tmux<{tmux_be.SESSION}>：{task[:60]}")
+                        else:
+                            client.send_message(user_id, context_token,
+                                                f"⚠️ 常驻会话不可用：{r}")
+
+                # /screen：抓常驻会话当前画面（看进度 / 排队情况 / 死因）
+                elif stripped == "/screen":
+                    if not tmux_be.has_session():
+                        client.send_message(user_id, context_token,
+                                            "常驻会话未运行，/t <消息> 会自动创建。")
+                    else:
+                        client.send_message(user_id, context_token,
+                                            tmux_be.capture(40)[:2000] or "（空）")
+
+                # /esc：打断常驻会话当前回合（插队说新话）
+                elif stripped == "/esc":
+                    tmux_be.send_escape()
+                    client.send_message(user_id, context_token, "⏹️ 已发送打断（Esc）。")
+
+                # /tap <键>：向常驻会话透传按键（权限确认选 1/2、C-c 等）
+                elif stripped == "/tap" or stripped.startswith("/tap "):
+                    keys = stripped[4:].strip()
+                    if not keys:
+                        client.send_message(user_id, context_token,
+                                            "用法：/tap <键>（tmux 键名，如 1 / y / Enter / "
+                                            "C-c / Up，可多个空格分隔）")
+                    else:
+                        tmux_be.send_keys(keys)
+                        client.send_message(user_id, context_token, f"⌨️ 已发送：{keys}")
+
+                # /texit：结束常驻会话（历史 transcript 留盘，/sessions 可查）
+                elif stripped == "/texit":
+                    tmux_be.kill_session()
+                    client.send_message(user_id, context_token,
+                                        "👋 常驻会话已结束，下次 /t 自动新建"
+                                        "（不带旧上下文；历史 /sessions 可查）。")
 
                 # 裸 /bg：给用法（带任务的 "/bg xxx" 走下面的分支）
                 elif stripped == "/bg":

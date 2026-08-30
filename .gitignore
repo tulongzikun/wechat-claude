@@ -9,6 +9,8 @@ qr_url.txt
 
 # 含真实 user_id + context_token（bot 每收一条消息落盘）
 latest_ctx.json
+# tmux 常驻会话绑定（含真实 user_id）
+tmux_state.json
 # 历史增量 SHA（已改成无状态时间窗口，弃用，保险忽略）
 update_state.json
 

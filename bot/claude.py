@@ -568,7 +568,15 @@ _HELP = """📖 Bot 指令（均以 / 开头）
 • /file <路径> [附言] — 把服务器上的文件/图片/视频发到微信（仅管理员）
 • /bg <任务> — 后台跑长任务（续当前会话，完成推回）
 • /jobs — 后台作业状态
-• /reset — 同 /exit（清空当前对话）"""
+• /reset — 同 /exit（清空当前对话）
+
+【tmux 常驻会话（免超时，推荐长任务用）】
+• /t <消息> — 发进常驻会话（瞬间送达，在跑会排队，回复由 hook 推送）
+• /screen — 看常驻会话当前画面（进度/排队/死因）
+• /esc — 打断常驻会话当前任务
+• /tap <键> — 透传按键（权限确认选 1/y、C-c 等）
+• /texit — 结束常驻会话（历史 /sessions 可查）
+• 电脑上 `tmux attach -t wxclaude` 可全交互接管同一个会话"""
 
 
 def handle_monitor_command(text: str, user_id: str) -> str | None:
