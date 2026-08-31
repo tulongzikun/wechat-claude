@@ -70,25 +70,33 @@ def last_week_window() -> tuple[datetime.datetime, datetime.datetime]:
 
 # ---------- arXiv 抓取 ----------
 
-def fetch_arxiv(max_results: int = MAX_RESULTS) -> list[dict]:
-    """拉最近 q-fin 论文（按 submittedDate 降序），解析成列表。失败返回 []。"""
+def fetch_arxiv(max_results: int = MAX_RESULTS) -> list[dict] | None:
+    """拉最近 q-fin 论文（按 submittedDate 降序），解析成列表。
+
+    返回 None = 抓取失败（网络/限流），[] = 抓到了但 0 篇——两者语义不同，
+    main 里 None 直接走失败通知，绝不把失败伪装成"上周 0 篇"推送出去
+    （2026-08-31 10:00 实际事故：arXiv 429 两次→📭"共 0 篇，均未命中"）。
+    """
     url = (f"{ARXIV_API}?search_query=cat:q-fin*&max_results={max_results}"
            f"&sortBy=submittedDate&sortOrder=descending")
     log(f"抓取 arXiv q-fin（最多 {max_results} 篇）…")
     data = b""
-    for attempt in range(2):
+    # 429 退避：arXiv 限流通常几分钟内恢复，3 秒重试等于白试（08-31 两连挂的教训）
+    delays = (0, 30, 60, 120)
+    for attempt, delay in enumerate(delays, 1):
+        if delay:
+            log(f"  退避 {delay}s 后第 {attempt} 次尝试…")
+            time.sleep(delay)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "weekly-papers/1.0"})
             with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
                 data = r.read()
             break
         except Exception as e:
-            log(f"  抓取失败（第 {attempt + 1} 次）: {e}")
-            if attempt == 0:
-                time.sleep(3)
+            log(f"  抓取失败（第 {attempt} 次）: {e}")
     if not data:
-        log("❌ arXiv 抓取失败，放弃")
-        return []
+        log("❌ arXiv 抓取失败（重试耗尽）")
+        return None
 
     papers = []
     try:
@@ -204,6 +212,18 @@ def main() -> None:
     log(f"窗口：{start:%Y-%m-%d %a} ~ {end:%Y-%m-%d %a}（{tz} 上个自然周）")
 
     papers = fetch_arxiv()
+    if papers is None:
+        # 抓取失败 ≠ 上周没有论文（08-31 事故根因）——推失败告警而非伪装成
+        # "共 0 篇"；收到告警可手动重跑 run.sh weekly_papers（窗口是固定日历周，
+        # 当天任何时间重跑结果一致）。
+        msg = (f"⚠️ 每周论文速递（{start:%m-%d}~{end - datetime.timedelta(days=1):%m-%d}）："
+               f"arXiv 抓取失败（429/网络），本期未生成。可手动重跑补发。")
+        log("❌ 抓取失败，推送失败告警（不伪装成 0 篇）。")
+        if DRY_RUN:
+            print(msg)
+            return
+        push(msg, hook_env="WECOM_WEBHOOK_PAPERS")
+        return
     hits, total = filter_papers(papers, start, end)
     log(f"窗口内 {total} 篇，关键词命中 {len(hits)} 篇")
     summary = summarize(hits, start, end)
