@@ -26,6 +26,7 @@ import xml.etree.ElementTree as ET
 from daily_update import push, MODEL, fit_bytes   # 复用推送 + 模型名 + 字节预算裁剪
 
 ARXIV_API = "https://export.arxiv.org/api/query"
+ARXIV_RECENT = "https://arxiv.org/list/q-fin/recent"   # 备胎：主站列表页（限流与 export 独立）
 NS = {
     "a": "http://www.w3.org/2005/Atom",
     "os": "http://a9.com/-/spec/opensearch/1.1/",
@@ -128,6 +129,86 @@ def fetch_arxiv(max_results: int = MAX_RESULTS) -> list[dict] | None:
     return papers
 
 
+# ---------- API 备胎：主站列表页 ----------
+
+def _http_get(url: str) -> bytes | None:
+    """带两次重试的 GET（10s 间隔）。备胎路径专用。"""
+    for attempt in (1, 2, 3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "weekly-papers/1.0"})
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+                return r.read()
+        except Exception as e:
+            log(f"  抓取失败（第 {attempt} 次 {url.split('/')[-1][:30]}）: {e}")
+            if attempt < 3:
+                time.sleep(10)
+    return None
+
+
+def fetch_arxiv_listing(start, end) -> list[dict] | None:
+    """API 被 429 时的备胎：arxiv.org 主站 recent 列表。
+
+    主站与 export（API host）限流独立——2026-08-31 export 被公司 NAT 出口 IP
+    429 两小时+未解封时主站列表页仍秒开（Scholar 无 API 且 403，月度页无日期，
+    都不可用；recent 有按公告日分段的 h3 + dt/dd 题录 + skip/show 分页）。
+
+    两步：① recent 翻页拿 窗口内的 (id, 公告日, 标题)——无摘要；② 只对标题
+    关键词命中的逐篇 /abs 补摘要（1.5s 间隔，命中通常 10~25 篇，控制请求数）。
+    口径差异（日志会注明）：比 API 少一层摘要关键词召回，标题不含主题词的
+    论文会漏；published 取公告日 00:00 UTC（日粒度，周边界与 API 差≤1天）。
+    失败返回 None；返回的列表含窗口内全部论文（未补摘要的 summary 为空，
+    filter_papers 的 total 口径仍准确）。
+    """
+    day_re = re.compile(r"<h3[^>]*>(\w{3}, \d+ \w+ \d{4})[^<]*</h3>")
+    ent_re = re.compile(
+        # 注意 arXiv 列表页的 href 等号前有随机空格（href ="/abs/…"），别"顺手修齐"
+        r'<dt>.*?href\s*=\s*"/abs/([\d.v]+)".*?list-title mathjax\'>.*?</span>\s*(.*?)\s*</div>', re.S)
+    start_utc = start.astimezone(datetime.timezone.utc)
+    end_utc = end.astimezone(datetime.timezone.utc)
+    papers, skip, too_old = [], 0, False
+    for _page in range(8):                      # 最多 8 页防死循环
+        html = _http_get(f"{ARXIV_RECENT}?skip={skip}&show=100")
+        if html is None:
+            log(f"  ⚠️ 列表页翻页失败（skip={skip}），用已拿到的 {len(papers)} 篇继续")
+            break
+        text = html.decode("utf-8", "ignore")
+        blocks = day_re.split(text)             # [前言, 日1, 体1, 日2, 体2, ...]
+        for i in range(1, len(blocks) - 1, 2):
+            day = datetime.datetime.strptime(
+                blocks[i], "%a, %d %b %Y").replace(tzinfo=datetime.timezone.utc)
+            if day < start_utc:
+                too_old = True                  # 更早的公告日不必再翻
+                continue
+            if day >= end_utc:
+                continue
+            for pid, title in ent_re.findall(blocks[i + 1]):
+                papers.append({
+                    "title": " ".join(title.split()), "summary": "",
+                    "link": f"https://arxiv.org/abs/{pid}",
+                    "published": day, "categories": [],
+                })
+        if too_old or not text.strip():
+            break
+        skip += len(ent_re.findall(text))       # 页内实际条目数（日段可能截断）
+    if not papers:
+        log("❌ 列表页备胎也失败")
+        return None
+    # 标题命中才补摘要（请求数收敛）；未命中的保留空摘要（total 口径不受影响）
+    need = [p for p in papers
+            if any(k.search(p["title"]) for k in TOPIC_KW.values())]
+    log(f"  备胎口径：窗口内 {len(papers)} 篇，标题命中 {len(need)} 篇（逐篇补摘要）")
+    for p in need:
+        b = _http_get(p["link"])
+        if b:
+            m = re.search(
+                r'<blockquote class="abstract mathjax">\s*<span[^>]*>Abstract:</span>'
+                r"(.*?)</blockquote>", b.decode("utf-8", "ignore"), re.S)
+            if m:
+                p["summary"] = " ".join(m.group(1).replace("</p>", " ").split())
+        time.sleep(1.5)
+    return papers
+
+
 # ---------- 筛选 ----------
 
 def filter_papers(papers, start, end):
@@ -182,24 +263,43 @@ def summarize(hits, start, end) -> str | None:
     )
     from anthropic import Anthropic  # 延迟 import
     client = Anthropic()  # 自动用 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL
-    r = client.messages.create(
-        model=MODEL, max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
+    text = ""
+    for attempt in (1, 2):
+        try:
+            # thinking=disabled：glm-5.3 等推理模型默认先出 thinking 块会吃光
+            # max_tokens（stop=max_tokens 且 0 个 text 块）——与 08-27 daily_update
+            # 谎报同根因，08-31 又在 weekly_papers 踩了一次（切 glm-5.3 后首跑）。
+            r = client.messages.create(
+                model=MODEL, max_tokens=2000,
+                thinking={"type": "disabled"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(b.text for b in r.content
+                           if getattr(b, "type", None) == "text").strip()
+            if text:
+                break
+            log(f"  ⚠️ 摘要 LLM 返回空文本（第 {attempt} 次，stop={r.stop_reason}）")
+        except Exception as e:
+            log(f"  ⚠️ 摘要 LLM 调用失败（第 {attempt} 次）：{type(e).__name__} {str(e)[:120]}")
+    if not text:
+        return None
     # LLM 对字数不自控、逐次波动：超字节预算就明确要求压缩，重生成一次
-    if text and len(text.encode("utf-8")) > SUMMARY_BYTES:
+    if len(text.encode("utf-8")) > SUMMARY_BYTES:
         log(f"  总结 {len(text.encode('utf-8'))} 字节超预算，压缩重生成…")
-        r = client.messages.create(
-            model=MODEL, max_tokens=1500,
-            messages=[{"role": "user", "content":
-                       "下面这份论文速递太长了，必须压缩到 900 字以内（含链接）。"
-                       "保持 Top10、主题分节和每篇的英文原题，点评压到 ≤25 字，删掉修饰词。\n\n"
-                       + text}],
-        )
-        t2 = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
-        if t2:
-            text = t2
+        try:
+            r = client.messages.create(
+                model=MODEL, max_tokens=1500,
+                thinking={"type": "disabled"},
+                messages=[{"role": "user", "content":
+                           "下面这份论文速递太长了，必须压缩到 900 字以内（含链接）。"
+                           "保持 Top10、主题分节和每篇的英文原题，点评压到 ≤25 字，删掉修饰词。\n\n"
+                           + text}],
+            )
+            t2 = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
+            if t2:
+                text = t2
+        except Exception as e:
+            log(f"  ⚠️ 压缩重生成失败（用初稿）：{type(e).__name__} {str(e)[:120]}")
     return text or None
 
 
@@ -212,6 +312,9 @@ def main() -> None:
     log(f"窗口：{start:%Y-%m-%d %a} ~ {end:%Y-%m-%d %a}（{tz} 上个自然周）")
 
     papers = fetch_arxiv()
+    if papers is None:
+        log("  ↩️ API 不可用（429/网络），切换备胎：arxiv.org 主站列表页")
+        papers = fetch_arxiv_listing(start, end)
     if papers is None:
         # 抓取失败 ≠ 上周没有论文（08-31 事故根因）——推失败告警而非伪装成
         # "共 0 篇"；收到告警可手动重跑 run.sh weekly_papers（窗口是固定日历周，
@@ -226,10 +329,9 @@ def main() -> None:
         return
     hits, total = filter_papers(papers, start, end)
     log(f"窗口内 {total} 篇，关键词命中 {len(hits)} 篇")
-    summary = summarize(hits, start, end)
 
     win = f"{start:%m-%d}~{end - datetime.timedelta(days=1):%m-%d}"
-    if summary is None:
+    if not hits:
         msg = (f"📭 每周论文速递（{win}）：上周 arXiv q-fin 共 {total} 篇，"
                f"均未命中期货/股票/趋势/多因子/择时/量化。")
         log("无命中。")
@@ -238,6 +340,14 @@ def main() -> None:
             return
         push(msg, hook_env="WECOM_WEBHOOK_PAPERS")
         return
+
+    summary = summarize(hits, start, end)
+    if summary is None:
+        # LLM 失败 ≠ 零命中（08-31 事故变体：12 篇命中被推成"均未命中"）——
+        # 退化成原始命中列表照常推送，绝不谎报
+        log("  ⚠️ AI 摘要两试均空，退化为命中论文原始列表推送")
+        plain = "\n".join(f"- **{p['title']}**\n  {p['link']}" for p in hits[:MAX_HITS])
+        summary = (f"⚠️ AI 摘要生成失败（网关异常），命中 {len(hits)} 篇原始列表：\n{plain}")
 
     top_n = min(10, len(hits))
     header = (f"📚 每周论文速递 Top{top_n}（{win}）\n"
