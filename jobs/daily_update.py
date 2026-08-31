@@ -34,6 +34,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from common import MODEL, llm_text, log   # 共用 LLM 样板 / 模型名 / 日志（jobs/ 内）
+
 DIR = Path(__file__).resolve().parent          # jobs/（定时任务层）
 BOT_DIR = DIR.parent / "bot"                   # bot/（微信通讯层，token / latest_ctx 在这里）
 LATEST_CTX_FILE = BOT_DIR / "latest_ctx.json"  # {user_id: context_token}（bot 落盘）
@@ -50,18 +52,7 @@ MAX_REPLY_BYTES = 3600        # 字节上限（硬约束）：企微 markdown �
                               # 中文 1 字=3 字节，1800 字≈5400 字节会超——所以
                               # 真正的限制是字节不是字符，超了整行删减绝不半句截断
 
-# 模型：优先用网关配的 haiku 别名，回退到默认模型名
-MODEL = (
-    os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
-    or os.environ.get("ANTHROPIC_MODEL")
-    or "claude-haiku-4-5"
-)
-
 DRY_RUN = "--dry-run" in sys.argv
-
-
-def log(msg: str) -> None:
-    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
 # ---------- 磁盘小工具 ----------
@@ -311,29 +302,9 @@ def summarize(updates: list[dict], since: str) -> str | None:
         f"提交记录：\n{raw}"
     )
 
-    from anthropic import Anthropic  # 延迟 import：顶部不加载重模块
-    client = Anthropic()  # 自动用 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL
-    # 网关偶发返回空文本/抛异常（2026-08-27 17:00 实测空文本被当成"无提交"谎报过）。
-    # 重试一次；仍拿不到就返回 None，由 main 走确定性兜底——绝不因此谎报"无更新"。
-    for attempt in (1, 2):
-        try:
-            # thinking=disabled：glm-5.3 等推理模型默认先出 thinking 块，会把
-            # max_tokens 预算耗光（stop=max_tokens 且 0 个 text 块——08-27 17:00
-            # 谎报"无提交"的根因）。摘要任务不需要思考，直接关掉。
-            r = client.messages.create(
-                model=MODEL, max_tokens=2000,
-                thinking={"type": "disabled"},
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = "".join(b.text for b in r.content
-                           if getattr(b, "type", None) == "text").strip()
-            if text:
-                return text
-            log(f"  ⚠️ 摘要 LLM 返回空文本（第 {attempt} 次，stop={r.stop_reason}）")
-        except Exception as e:
-            log(f"  ⚠️ 摘要 LLM 调用失败（第 {attempt} 次）："
-                f"{type(e).__name__} {str(e)[:120]}")
-    return None
+    # thinking=disabled + 重试 + 空文本检测内建在 common.llm_text（08-27 空文本
+    # 被当"无提交"谎报的教训）；失败返回 None，由 main 走确定性兜底。
+    return llm_text(prompt, label="摘要 LLM")
 
 
 def _plain_digest(updates: list[dict]) -> str:

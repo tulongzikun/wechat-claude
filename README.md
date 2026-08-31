@@ -39,6 +39,7 @@ wechat/
 │   └── start.sh / stop.sh   # 后台常驻启停
 ├── jobs/              # 定时任务层（cron 调用，主动推送）
 │   ├── run.sh         #   统一入口：环境装载 + 时区，跑 jobs/<任务名>.py
+│   ├── common.py      #   共用基建：llm_text / http_get / log（防谎报三件套内建）
 │   ├── tasks.conf     #   任务注册表：任务名 | cron | 专属 webhook 变量 | 说明
 │   ├── daily_update.py    # 每天 17:00：GHE 各 org 全部仓库 mainline 提交摘要（API 取数，名单落 repository.txt）
 │   ├── weekly_papers.py   # 每周一 10:00：arXiv q-fin 上周论文 Top10 速递
@@ -83,14 +84,22 @@ bot 与 jobs 的关系：bot 负责微信通讯（被动回复 + 把每个用户
 任务三件套：**`jobs/<任务名>.py`（实现）→ `jobs/tasks.conf`（登记）→ crontab（挂载）**，
 都通过唯一的 `run.sh` 入口调起（环境装载/时区不用每个任务抄一份 wrapper）。
 
-1. **写实现** `jobs/<任务名>.py`，复用 `daily_update` 的基建：
+1. **写实现** `jobs/<任务名>.py`，复用公共基建：
    ```python
-   from daily_update import push, fit_bytes, log   # 双通道推送/字节预算/日志
+   from common import llm_text, http_get, log      # LLM 调用/抓取重试/日志
+   from daily_update import push, fit_bytes        # 双通道推送/字节预算裁剪
    ```
+   - **LLM 一律走 `llm_text(prompt, label=...)`**：thinking=disabled + 失败重试 +
+     空文本检测内建——glm-5.3 等推理模型不关 thinking 会先出思考块吃光
+     max_tokens（返回空文本），是 08-27/08-31 两次「无内容」谎报的根因；
+     返回值契约 **None=失败、""=真空**：失败走告警/确定性兜底，绝不当
+     「空结果」播报；
+   - 抓取走 `http_get(url, attempts=…, delays=…)`：失败返回 None（同上契约），
+     429 退避间隔别低于 10s（3 秒重试等于白试）；
    - 推送：`push(text, hook_env="WECOM_WEBHOOK_<大写任务名>")`——企微群 + 个人微信双通道；
    - 长度：企微 markdown 上限 **4096 字节**（中文 1 字=3 字节），全文过 `fit_bytes()`；
      LLM 产出超预算先压缩重生成一次，`fit_bytes` 兜底（整行删、绝不半句截断）；
-   - LLM 输入/输出过网关内容过滤（敏感措辞会 1301 拒绝），送模型前脱敏 + try/except 兜底；
+   - LLM 输入/输出过网关内容过滤（敏感措辞会 1301 拒绝），送模型前脱敏 + 失败兜底；
    - 支持 `--dry-run`（只抓+总结+打印，不推送）。
 2. **登记**：`jobs/tasks.conf` 加一行 `任务名 | cron 表达式 | 专属 webhook 变量 | 说明`。
 3. **挂载**：crontab 的 `CRON_TZ=Asia/Shanghai` 段内加一条

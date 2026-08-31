@@ -26,6 +26,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from common import llm_text                       # 共用 LLM 样板（防谎报内建）
 from daily_update import push, fit_bytes, log   # 复用推送/字节预算/日志
 
 DRY_RUN = "--dry-run" in sys.argv
@@ -77,20 +78,13 @@ def pct(x, prev) -> str:
 
 def llm_summary(section_title: str, lines: list[str], n_chars: int = 120) -> str:
     """给一节数据写 1~2 句中文小结（唯一经 LLM 的部分）。失败返回空。"""
-    from anthropic import Anthropic
     prompt = (f"下面是「{section_title}」的数据列表。请写 1~2 句中文小结（≤{n_chars}字），"
               "点出关键趋势/超预期方向与含义，措辞客观中性、无链接、不含敏感词汇，"
               "不要逐条复述。直接输出小结文本。\n\n" + "\n".join(lines))
-    try:
-        r = Anthropic().messages.create(
-            model=os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
-            or os.environ.get("ANTHROPIC_MODEL") or "claude-haiku-4-5",
-            max_tokens=300, messages=[{"role": "user", "content": prompt}])
-        return "".join(b.text for b in r.content
-                       if getattr(b, "type", "") == "text").strip()
-    except Exception as e:
-        log(f"  ⚠️ 小结生成失败（{section_title}），跳过: {e}")
-        return ""
+    # llm_text 内建 thinking=disabled + 重试 + 空文本检测（glm-5.3 必需）；
+    # None/"" 都只是丢了装饰性小结，数据本体不受影响
+    return llm_text(prompt, max_tokens=300, retries=1,
+                    label=f"小结({section_title})") or ""
 
 
 # ---------- 经济日历（百度股市通，经 akshare；一/二/四节共用） ----------
@@ -525,16 +519,10 @@ def geopolitics() -> list[str]:
     if not all_items:
         return []
 
-    from anthropic import Anthropic
-    model = (os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
-             or os.environ.get("ANTHROPIC_MODEL") or "claude-haiku-4-5")
-
-    def _llm(prompt: str) -> str:
-        r = Anthropic().messages.create(
-            model=model, max_tokens=600,
-            messages=[{"role": "user", "content": prompt}])
-        return "".join(b.text for b in r.content
-                       if getattr(b, "type", "") == "text").strip()
+    def _llm(prompt: str) -> str | None:
+        # 内建 thinking=disabled + 空文本检测（glm-5.3 必需）；retries=1——
+        # 失败由下面的减半重试 / 兜底逻辑接住（批太大被网关组合打分拒时换小批）
+        return llm_text(prompt, max_tokens=600, retries=1, label="国际局势 LLM")
 
     # ① 分批归纳（每批 6 条：批太大网关组合打分会拒，失败减半重试一次）
     bullets: list[str] = []
@@ -543,34 +531,33 @@ def geopolitics() -> list[str]:
     for i in range(0, len(titles), 6):
         batch = titles[i:i + 6]
         for size in (len(batch), max(3, len(batch) // 2)):
-            try:
-                text = _llm(
-                    "下面是一批上周国际时政/经贸中文新闻标题（措辞已部分中性化）。"
-                    "归纳成 1~2 条要点：每条 **加粗一句话概括** + 1 句进展 + "
-                    "1 句对市场/能源/供应链的影响；同事件合并，无关舍弃；"
-                    "不输出链接，来源媒体名括注句尾，措辞中性客观。markdown 列表。\n\n"
-                    + "\n".join(f"- {t}" for t in batch[:size]))
+            text = _llm(
+                "下面是一批上周国际时政/经贸中文新闻标题（措辞已部分中性化）。"
+                "归纳成 1~2 条要点：每条 **加粗一句话概括** + 1 句进展 + "
+                "1 句对市场/能源/供应链的影响；同事件合并，无关舍弃；"
+                "不输出链接，来源媒体名括注句尾，措辞中性客观。markdown 列表。\n\n"
+                + "\n".join(f"- {t}" for t in batch[:size]))
+            if text:
                 bullets.extend(l for l in text.splitlines() if l.strip())
                 break
-            except Exception as e:
-                log(f"  ⚠️ 国际局势批归纳失败（{size} 条）: {e}")
+            log(f"  ⚠️ 国际局势批归纳失败（{size} 条）")
     bullets = _geo_tidy(bullets)
     if not bullets:
         return _geo_fallback(per_q)
 
     # ② 合并成稿（输入已是中性化要点）
-    try:
-        text = _llm(
-            "下面是对上周国际时政/经贸新闻的分批归纳要点。请合并成最终 "
-            "3~5 条本周国际局势要点：**同一事件多批重复出现时只保留一条**"
-            "（取信息最全的），每条 **加粗一句话概括** + 1 句进展 + 1 句对"
-            "市场/能源/供应链的影响，每条 ≤60 字，按对市场影响排序；"
-            "措辞中性客观，不输出链接。markdown 列表。\n\n" + "\n".join(bullets))
+    text = _llm(
+        "下面是对上周国际时政/经贸新闻的分批归纳要点。请合并成最终 "
+        "3~5 条本周国际局势要点：**同一事件多批重复出现时只保留一条**"
+        "（取信息最全的），每条 **加粗一句话概括** + 1 句进展 + 1 句对"
+        "市场/能源/供应链的影响，每条 ≤60 字，按对市场影响排序；"
+        "措辞中性客观，不输出链接。markdown 列表。\n\n" + "\n".join(bullets))
+    if text:
         out = _geo_tidy([l for l in text.splitlines() if l.strip()])
-        return out if out else bullets[:5]
-    except Exception as e:
-        log(f"  ⚠️ 国际局势合并失败，用分批要点: {e}")
-        return bullets[:5]
+        if out:
+            return out
+    log("  ⚠️ 国际局势合并失败，用分批要点")
+    return bullets[:5]
 
 
 def _geo_tidy(lines: list[str]) -> list[str]:

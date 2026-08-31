@@ -24,7 +24,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-from daily_update import push, MODEL, fit_bytes, log   # 复用推送/模型/字节预算
+from common import llm_text                          # 共用 LLM 样板（防谎报内建）
+from daily_update import push, fit_bytes, log        # 复用推送/字节预算/日志
 
 GNEWS = "https://news.google.com/rss/search"
 FETCH_TIMEOUT = 30
@@ -291,32 +292,21 @@ def summarize(news: dict[str, list[dict]], start, end,
         "6. 用 markdown 列表，全文严格 ≤1100 字——硬要求，超长会被系统整条删掉。\n\n"
         f"资讯列表：\n{raw}"
     )
-    from anthropic import Anthropic  # 延迟 import
-    client = Anthropic()
-    try:
-        r = client.messages.create(
-            model=MODEL, max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception as e:
+    # llm_text 内建 thinking=disabled + 重试 + 空文本检测（glm-5.3 下无 thinking
+    # 会静默退化成纯条目列表——每周白丢 AI 总结；2026-08-31 与 weekly_papers 同批修）
+    text = llm_text(prompt, label="游戏资讯 LLM")
+    if text is None:
         # 网关内容过滤/模型不可用：退化为纯条目列表（不经模型，内容不受影响）
-        log(f"  ⚠️ 模型总结失败（{e}），退化为纯条目列表")
+        log("  ⚠️ 模型总结失败，退化为纯条目列表")
         return plain_digest(news)
-    text = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
-    if text and len(text.encode("utf-8")) > SUMMARY_BYTES:  # LLM 字数不自控，压缩一次
+    if len(text.encode("utf-8")) > SUMMARY_BYTES:  # LLM 字数不自控，压缩一次
         log(f"  总结 {len(text.encode('utf-8'))} 字节超预算，压缩重生成…")
-        try:
-            r = client.messages.create(
-                model=MODEL, max_tokens=1500,
-                messages=[{"role": "user", "content":
-                           "下面这份游戏资讯太长了，必须压缩到 1100 字以内（不含链接，别加链接）。"
-                           "保持游戏分节与 更新/未实装情报/联动 分类，删掉次要条目、保留每条最关键信息。\n\n" + text}],
-            )
-            t2 = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
-            if t2:
-                text = t2
-        except Exception as e:
-            log(f"  ⚠️ 压缩重生成失败，沿用初稿: {e}")
+        t2 = llm_text(
+            "下面这份游戏资讯太长了，必须压缩到 1100 字以内（不含链接，别加链接）。"
+            "保持游戏分节与 更新/未实装情报/联动 分类，删掉次要条目、保留每条最关键信息。\n\n" + text,
+            max_tokens=1500, retries=1, label="压缩重生成")
+        if t2:
+            text = t2
     return text or None
 
 

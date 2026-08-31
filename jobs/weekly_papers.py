@@ -20,10 +20,10 @@ import os
 import re
 import sys
 import time
-import urllib.request
 import xml.etree.ElementTree as ET
 
-from daily_update import push, MODEL, fit_bytes   # 复用推送 + 模型名 + 字节预算裁剪
+from common import http_get, llm_text, log          # 共用 LLM/抓取样板（防谎报内建）
+from daily_update import push, fit_bytes            # 复用推送 + 字节预算裁剪
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_RECENT = "https://arxiv.org/list/q-fin/recent"   # 备胎：主站列表页（限流与 export 独立）
@@ -49,10 +49,6 @@ TOPIC_KW = {
 TOPIC_ORDER = ["期货", "股票", "趋势", "多因子", "择时", "量化"]
 
 DRY_RUN = "--dry-run" in sys.argv
-
-
-def log(msg: str) -> None:
-    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
 # ---------- 时间窗口 ----------
@@ -81,21 +77,10 @@ def fetch_arxiv(max_results: int = MAX_RESULTS) -> list[dict] | None:
     url = (f"{ARXIV_API}?search_query=cat:q-fin*&max_results={max_results}"
            f"&sortBy=submittedDate&sortOrder=descending")
     log(f"抓取 arXiv q-fin（最多 {max_results} 篇）…")
-    data = b""
     # 429 退避：arXiv 限流通常几分钟内恢复，3 秒重试等于白试（08-31 两连挂的教训）
-    delays = (0, 30, 60, 120)
-    for attempt, delay in enumerate(delays, 1):
-        if delay:
-            log(f"  退避 {delay}s 后第 {attempt} 次尝试…")
-            time.sleep(delay)
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "weekly-papers/1.0"})
-            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
-                data = r.read()
-            break
-        except Exception as e:
-            log(f"  抓取失败（第 {attempt} 次）: {e}")
-    if not data:
+    data = http_get(url, timeout=FETCH_TIMEOUT, attempts=4,
+                    delays=(30, 60, 120), user_agent="weekly-papers/1.0")
+    if data is None:
         log("❌ arXiv 抓取失败（重试耗尽）")
         return None
 
@@ -131,20 +116,6 @@ def fetch_arxiv(max_results: int = MAX_RESULTS) -> list[dict] | None:
 
 # ---------- API 备胎：主站列表页 ----------
 
-def _http_get(url: str) -> bytes | None:
-    """带两次重试的 GET（10s 间隔）。备胎路径专用。"""
-    for attempt in (1, 2, 3):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "weekly-papers/1.0"})
-            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
-                return r.read()
-        except Exception as e:
-            log(f"  抓取失败（第 {attempt} 次 {url.split('/')[-1][:30]}）: {e}")
-            if attempt < 3:
-                time.sleep(10)
-    return None
-
-
 def fetch_arxiv_listing(start, end) -> list[dict] | None:
     """API 被 429 时的备胎：arxiv.org 主站 recent 列表。
 
@@ -167,7 +138,8 @@ def fetch_arxiv_listing(start, end) -> list[dict] | None:
     end_utc = end.astimezone(datetime.timezone.utc)
     papers, skip, too_old = [], 0, False
     for _page in range(8):                      # 最多 8 页防死循环
-        html = _http_get(f"{ARXIV_RECENT}?skip={skip}&show=100")
+        html = http_get(f"{ARXIV_RECENT}?skip={skip}&show=100",
+                        timeout=FETCH_TIMEOUT, user_agent="weekly-papers/1.0")
         if html is None:
             log(f"  ⚠️ 列表页翻页失败（skip={skip}），用已拿到的 {len(papers)} 篇继续")
             break
@@ -198,7 +170,8 @@ def fetch_arxiv_listing(start, end) -> list[dict] | None:
             if any(k.search(p["title"]) for k in TOPIC_KW.values())]
     log(f"  备胎口径：窗口内 {len(papers)} 篇，标题命中 {len(need)} 篇（逐篇补摘要）")
     for p in need:
-        b = _http_get(p["link"])
+        b = http_get(p["link"], timeout=FETCH_TIMEOUT, attempts=1,
+                     user_agent="weekly-papers/1.0")
         if b:
             m = re.search(
                 r'<blockquote class="abstract mathjax">\s*<span[^>]*>Abstract:</span>'
@@ -261,45 +234,20 @@ def summarize(hits, start, end) -> str | None:
         "超长会被系统整条删掉。\n\n"
         f"论文列表：\n{raw}"
     )
-    from anthropic import Anthropic  # 延迟 import
-    client = Anthropic()  # 自动用 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL
-    text = ""
-    for attempt in (1, 2):
-        try:
-            # thinking=disabled：glm-5.3 等推理模型默认先出 thinking 块会吃光
-            # max_tokens（stop=max_tokens 且 0 个 text 块）——与 08-27 daily_update
-            # 谎报同根因，08-31 又在 weekly_papers 踩了一次（切 glm-5.3 后首跑）。
-            r = client.messages.create(
-                model=MODEL, max_tokens=2000,
-                thinking={"type": "disabled"},
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = "".join(b.text for b in r.content
-                           if getattr(b, "type", None) == "text").strip()
-            if text:
-                break
-            log(f"  ⚠️ 摘要 LLM 返回空文本（第 {attempt} 次，stop={r.stop_reason}）")
-        except Exception as e:
-            log(f"  ⚠️ 摘要 LLM 调用失败（第 {attempt} 次）：{type(e).__name__} {str(e)[:120]}")
-    if not text:
+    # thinking=disabled + 重试 + 空文本检测内建在 common.llm_text（08-31 在本文件
+    # 踩过：切 glm-5.3 首跑 thinking 吃光 max_tokens，12 篇命中被推成"均未命中"）
+    text = llm_text(prompt, label="论文摘要 LLM")
+    if text is None:
         return None
     # LLM 对字数不自控、逐次波动：超字节预算就明确要求压缩，重生成一次
     if len(text.encode("utf-8")) > SUMMARY_BYTES:
         log(f"  总结 {len(text.encode('utf-8'))} 字节超预算，压缩重生成…")
-        try:
-            r = client.messages.create(
-                model=MODEL, max_tokens=1500,
-                thinking={"type": "disabled"},
-                messages=[{"role": "user", "content":
-                           "下面这份论文速递太长了，必须压缩到 900 字以内（含链接）。"
-                           "保持 Top10、主题分节和每篇的英文原题，点评压到 ≤25 字，删掉修饰词。\n\n"
-                           + text}],
-            )
-            t2 = "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
-            if t2:
-                text = t2
-        except Exception as e:
-            log(f"  ⚠️ 压缩重生成失败（用初稿）：{type(e).__name__} {str(e)[:120]}")
+        t2 = llm_text(
+            "下面这份论文速递太长了，必须压缩到 900 字以内（含链接）。"
+            "保持 Top10、主题分节和每篇的英文原题，点评压到 ≤25 字，删掉修饰词。\n\n" + text,
+            max_tokens=1500, retries=1, label="压缩重生成")
+        if t2:
+            text = t2
     return text or None
 
 
