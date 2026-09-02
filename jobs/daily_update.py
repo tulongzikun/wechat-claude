@@ -142,12 +142,17 @@ def ghe_get(path: str, **params) -> list | dict | None:
 
 
 def list_org_repos(org: str) -> list[dict] | None:
-    """某组织名下全部仓库（分页拉全）。首页就失败返回 None（区别于真的 0 仓）。"""
+    """某组织名下全部仓库（分页拉全）。任一页失败返回 None（区别于真的 0 仓）。
+
+    翻页中途挂也整 org 作废而不是用已拉到的部分——部分名单一旦落盘会把尾页仓库
+    从 repository.txt 冲掉（破坏回退源），下游名单 diff 也会把漏掉的仓库误报成
+    "移除"；宁可整 org 回退旧名单（同 08-27 谎报原则）。
+    """
     repos, page = [], 1
     while True:
         batch = ghe_get(f"/orgs/{org}/repos", per_page=100, page=page, type="all")
         if batch is None:
-            return None if page == 1 else repos  # 翻页挂：用已拉到的部分
+            return None
         repos += batch
         if len(batch) < 100:
             return repos
@@ -168,12 +173,25 @@ def _read_repo_list_file() -> list[dict]:
     return out
 
 
-def refresh_repo_list() -> list[dict]:
-    """刷新监控名单：GHE_ORGS 各 org 的仓库全量 → 落盘 repository.txt，返回列表。
+def _diff_repo_names(stale: list[dict], fresh: list[dict]) -> tuple[list[str], list[str]]:
+    """两份名单的 diff：(新增, 移除)，按 full_name 排序。
+
+    移除 = 已删除/转出 org/对凭证不可见（如转私有），API 区分不了，报告措辞用"移出名单"。"""
+    old = {r["full_name"] for r in stale}
+    new = {r["full_name"] for r in fresh}
+    return sorted(new - old), sorted(old - new)
+
+
+def refresh_repo_list() -> tuple[list[dict], list[str], list[str]]:
+    """刷新监控名单：GHE_ORGS 各 org 的仓库全量 → 落盘 repository.txt。
+
+    返回 (监控列表, 新增仓库, 移除仓库)——后两个是与上一轮落盘名单的 diff（首跑
+    无基线、全量回退旧名单时都为空），供日报在总结开头报"名单变更"。
 
     每行 "owner/repo default分支"（人可读、也是 API 挂掉时的回退源）。某个 org
-    拉取失败时从旧名单补上该 org 的条目（别让一次抖动把半个名单冲掉）；全部失败
-    且没有旧名单可回退时直接抛错——宁可不推也不能装作"无提交"（同 08-27 谎报原则）。
+    拉取失败时从旧名单补上该 org 的条目（别让一次抖动把半个名单冲掉，也不会产生
+    假 diff——补的就是旧条目本身）；全部失败且没有旧名单可回退时直接抛错——宁可不推
+    也不能装作"无提交"（同 08-27 谎报原则）。
     """
     if not GHE_API or not GHE_ORGS:
         raise RuntimeError("GHE_API / GHE_ORGS 未配置（应在 .env 里）")
@@ -198,18 +216,25 @@ def refresh_repo_list() -> list[dict]:
         if stale:
             log(f"  ⚠️ 全部 org 列表拉取失败，回退 {REPO_LIST_FILE.name}"
                 f"（{len(stale)} 个，可能不含最新建仓）")
-            return stale
+            return stale, [], []
         raise RuntimeError("org 仓库列表拉取失败，且无 repository.txt 可回退")
+    # diff 只对成功拉取的 org 有意义；stale 为空 = 首跑无基线，不算"全部新增"
+    added, removed = _diff_repo_names(stale, fresh) if stale else ([], [])
     fresh.sort(key=lambda r: r["full_name"])
     lines = [f"{r['full_name']} {r.get('default_branch') or 'master'}" for r in fresh]
     REPO_LIST_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     log(f"监控名单：{len(fresh)} 个仓库（{', '.join(GHE_ORGS)}）→ {REPO_LIST_FILE.name}")
-    return fresh
+    if added or removed:
+        log("  名单变更：" + "；".join(
+            [f"新增 {len(added)}（{'、'.join(added)}）" if added else "",
+             f"移除 {len(removed)}（{'、'.join(removed)}）" if removed else ""]).strip("；"))
+    return fresh, added, removed
 
 
-def collect_updates(since: str) -> list[dict]:
+def collect_updates(since: str, repos: list[dict]) -> list[dict]:
     """遍历监控名单里的所有仓库，返回窗口内有提交的仓库列表。
 
+    名单由调用方（main）先 refresh 好（diff 还要用于报告的名单变更通知）。
     窗口 = since（本地 naive 串）之后、按 committer date 落到 default 分支的 commit。
     无状态、可重复：每次跑都报同一个日历窗口。commits API 的 since 与 git log
     --since 同义（committer date、按 UTC 比较），已实测与本地 git log 逐条一致。
@@ -219,7 +244,7 @@ def collect_updates(since: str) -> list[dict]:
     """
     since_utc = to_utc_iso(since)
     updates, failed = [], 0
-    for r in refresh_repo_list():
+    for r in repos:
         name, branch = r["full_name"], r.get("default_branch") or "master"
         # pushed_at 预筛：全仓最后一次 push 都早于窗口起点 ⇒ 任何分支都不可能有
         # 窗口内提交，省一次 commits 调用（回退名单无此信息时不跳）
@@ -315,6 +340,20 @@ def _plain_digest(updates: list[dict]) -> str:
         more = f"…（共 {u['count']} 条）" if u["count"] > 6 else ""
         lines.append(f"• {u['name']}({u['branch']})：{cs}{more}")
     return "\n".join(lines)
+
+
+def _repo_change_note(added: list[str], removed: list[str]) -> str:
+    """名单变更通知（新增/移除的仓库），无变更返回空串。
+
+    放在日报总结开头：新仓库即使窗口内没提交（空仓刚建）也值得知道；"移出名单"
+    = 已删除/转出/凭证不可见，API 区分不了，措辞不猜测原因。
+    """
+    parts = []
+    if added:
+        parts.append(f"➕ 新增仓库：{'、'.join(added)}")
+    if removed:
+        parts.append(f"➖ 移出名单：{'、'.join(removed)}")
+    return "\n".join(parts)
 
 
 # ---------- 推送 ----------
@@ -524,10 +563,14 @@ def main() -> None:
     since = since_yesterday_5pm()
     tz_name = os.environ.get("TZ", "(未设TZ)")
     log(f"报告窗口起点：{since}（{tz_name} 昨日17:00）")
-    updates = collect_updates(since)
+    repos, added, removed = refresh_repo_list()
+    updates = collect_updates(since, repos)
+    note = _repo_change_note(added, removed)
     if not updates:
         msg = (f"📭 {time.strftime('%m-%d')} 自昨日17:00起，"
                f"~/workspace 各项目 mainline 无新提交。")
+        if note:
+            msg += "\n" + note
         log("无更新。")
         if DRY_RUN:
             print(msg)
@@ -545,7 +588,8 @@ def main() -> None:
     total = sum(u["count"] for u in updates)
     header = (f"📢 项目每日更新（{time.strftime('%m-%d')}）\n"
               f"自昨日17:00起，{len(updates)} 个仓库共 {total} 条新提交")
-    full = header + "\n\n" + summary
+    # 名单变更放在总结开头（确定性文本，不走 LLM——仓库名是精确标识，不让模型转述）
+    full = header + "\n\n" + note + "\n\n" + summary if note else header + "\n\n" + summary
     full = fit_bytes(full)   # 字节预算硬约束（企微 4096B），整行删减不半句截断
 
     if DRY_RUN:
