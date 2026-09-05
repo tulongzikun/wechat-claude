@@ -144,6 +144,14 @@ def main() -> None:
                         client.send_message(user_id, context_token,
                                             "用法：/tap <键>（tmux 键名，如 1 / y / Enter / "
                                             "C-c / Up，可多个空格分隔）")
+                    elif any("一" <= c <= "鿿" for c in keys):
+                        # tmux 键名全是 ASCII——中文只会逐字敲进确认框（只认
+                        # 1/2/3/Esc）被无声吞掉，2026-09-04 回合因此悬死一整天
+                        client.send_message(user_id, context_token,
+                                            "⚠️ /tap 只透传按键（如 1 / 2 / 3 / y / Enter / "
+                                            "C-c），不能打句子。权限确认：看通知里的画面选 "
+                                            "1/2/3；要说话请先回应确认或 /esc 打断，"
+                                            "再直接发消息。")
                     else:
                         tmux_be.send_keys(keys)
                         client.send_message(user_id, context_token, f"⌨️ 已发送：{keys}")

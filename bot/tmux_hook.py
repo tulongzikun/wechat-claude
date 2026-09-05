@@ -63,6 +63,21 @@ def _push(text: str) -> None:
     _log(f"push 成功 -> {user}: {text[:60]!r}")
 
 
+def _pane_tail(max_lines: int = 14, max_bytes: int = 900) -> str:
+    """tmux 画面尾部（去空行）：权限确认时这就是确认框本体——待批命令和
+    1/2/3 选项都在里面。拿不到（tmux 不在/刚重建）返回空，通知退回纯文案。"""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-t", "wxclaude", "-p"],
+            capture_output=True, text=True, timeout=5)
+        lines = [l.rstrip() for l in r.stdout.splitlines() if l.strip()]
+        return "\n".join(lines[-max_lines:]).encode("utf-8")[:max_bytes].decode(
+            "utf-8", "ignore")
+    except Exception:
+        return ""
+
+
 def _wait_for_new_text(transcript_path: str, timeout: float = 5.0) -> str:
     """等本轮最终答案落盘。
 
@@ -129,7 +144,12 @@ def main() -> int:
             _log("stop:未等到新 assistant 文本(打断/空回合/超时),不推送")
     elif event == "notify":
         m = data.get("message") or "需要你关注"
-        _push(f"🔔(常驻会话):{m}\n(/tap <键> 回应,如 /tap 1;/esc 打断)")
+        # 在批什么必须可见：只推"Claude needs your permission"时用户不知道
+        # /tap 1 批的是什么——2026-09-04 由此卡了一整天（第二轮确认无人应、
+        # 回合悬死、Stop hook 不触发，用户以为 /use 没恢复上下文）。
+        panel = _pane_tail()
+        body = f"🔔(常驻会话):{m}\n{panel}\n" if panel else f"🔔(常驻会话):{m}\n"
+        _push(body + "(/tap <键> 回应,如 /tap 1;/esc 打断)")
     return 0
 
 
